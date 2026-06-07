@@ -67,7 +67,11 @@ agos/
 │       ├── security.rs            # Ring 0 SecurityEngine + SMTSolver
 │       ├── umi.rs                 # UnifiedModelInterface + driver abstraction
 │       ├── sandbox.rs             # .aapp loader + package manager
-│       └── api.rs                 # axum REST API handlers (25 endpoints)
+│       ├── z3_solver.rs           # Z3 SMT solver (feature: z3-solver)
+│       ├── sandbox_wasm.rs        # WebAssembly sandbox (feature: wasm-sandbox)
+│       ├── embodiment.rs          # Embodiment VLA pipeline (feature: embodiment)
+│       ├── grid.rs                # Decentralized Cognitive Grids
+│       └── api.rs                 # axum REST API handlers (35+ endpoints)
 │
 ├── agos-demo/                     # Java Spring Boot demo UI (port 8080)
 │   ├── pom.xml
@@ -131,7 +135,23 @@ curl http://127.0.0.1:8080/api/demo/status
 
 ## REST API Reference
 
-The Rust kernel exposes 25 REST endpoints. All use `Content-Type: application/json`.
+The Rust kernel exposes REST endpoints. All use `Content-Type: application/json`.
+
+### Feature Flags
+
+Some endpoints require feature flags:
+
+| Feature | Cargo flag | Additional endpoints |
+|---------|-----------|---------------------|
+| `z3-solver` | `--features z3-solver` | Enhances `/security/verify` with Z3 SMT |
+| `wasm-sandbox` | `--features wasm-sandbox` | `POST /sandbox/execute` |
+| `embodiment` | `--features embodiment` | 8 `/embodiment/*` endpoints |
+| `grid` | _always on_ | 7 `/grid/*` endpoints, no feature flag |
+
+Run with all features:
+```bash
+cargo run --features "z3-solver,wasm-sandbox,embodiment"
+```
 
 ### Kernel
 
@@ -182,11 +202,37 @@ The Rust kernel exposes 25 REST endpoints. All use `Content-Type: application/js
 
 ### Sandbox
 
+| Method | Path | Feature | Description |
+|--------|------|---------|-------------|
+| `POST` | `/sandbox/install` | — | Install `.aapp` package |
+| `POST` | `/sandbox/launch` | — | Launch installed app |
+| `GET` | `/sandbox/apps` | — | List available apps |
+| `POST` | `/sandbox/execute` | `wasm-sandbox` | Execute WASM tool |
+
+### Embodiment
+
+| Method | Path | Feature | Description |
+|--------|------|---------|-------------|
+| `POST` | `/embodiment/goal` | `embodiment` | Submit a goal with sensory inputs |
+| `GET` | `/embodiment/goals` | `embodiment` | List all goals |
+| `GET` | `/embodiment/goal/{id}` | `embodiment` | Get goal status |
+| `GET` | `/embodiment/goal/{id}/plan` | `embodiment` | Get action plan |
+| `POST` | `/embodiment/goal/{id}/clarify` | `embodiment` | Provide clarification |
+| `POST` | `/embodiment/goal/{id}/execute` | `embodiment` | Execute plan |
+| `GET` | `/embodiment/sensors` | `embodiment` | List available sensors |
+| `GET` | `/embodiment/apps` | `embodiment` | List available agent apps |
+
+### Grid
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/sandbox/install` | Install `.aapp` package |
-| `POST` | `/sandbox/launch` | Launch installed app |
-| `GET` | `/sandbox/apps` | List available apps |
+| `POST` | `/grid/join` | Register peer node on the grid |
+| `GET` | `/grid/peers` | List known peers |
+| `GET` | `/grid/stats` | Grid statistics |
+| `POST` | `/grid/heartbeat` | Record heartbeat from peer |
+| `POST` | `/grid/migrate` | Migrate agent to another node |
+| `POST` | `/grid/receive` | Accept migrated agent |
+| `POST` | `/grid/cipc/forward` | Forward cIPC message from another node |
 
 ---
 
@@ -242,25 +288,24 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 - **Phase 3 ✓** — Hierarchical Cognitive Memory + cIPC Bus (L1/L2/Vector RAM, structured IPC)
 - **Phase 4 ✓** — Ring 0 Neuro-Symbolic Guard Layer (SMT solver, policy enforcement)
 - **Phase 5 ✓** — Sandbox Installer + Integration Smoke Test (`.aapp` packages, demo scenario)
+- **Phase 6 ✓** — Episodic Compression Daemon (background tokio task, configurable TTL, L2 compression)
+- **Phase 7 ✓** — Native Z3 SMT Solver (optional feature, integrates Z3 into SecurityEngine)
+- **Phase 8 ✓** — WebAssembly Sandbox (optional feature, wasmtime-based tool execution with fuel metering)
+- **Phase 9 ✓** — Embodiment Layer (VLA pipeline, multimodal goal processing, sub-agent orchestration, figure-of-speech detection, UMI-powered semantic resolution)
+- **Phase 10 ✓** — Decentralized Cognitive Grids (grid discovery, peer heartbeats, agent migration, remote cIPC forwarding)
 
-**Future:** See [`FEATURES_GUIDE.md`](FEATURES_GUIDE.md) for detailed implementation blueprints, file-level change plans, and testing strategies for all upcoming features.
-
-| Feature | Effort | Impact |
-|---------|--------|--------|
-| Phase 6 — Episodic Compression Daemon | 3 days | Medium |
-| Phase 7 — Native Z3 SMT Solver | 5 days | Medium |
-| Phase 8 — WebAssembly Sandbox | 2 weeks | High |
-| Phase 9 — Embodiment Layer (VLA pipeline) | 3 weeks | High |
-| Phase 10 — Decentralized Cognitive Grids | 4 weeks | High |
-| Persistent Storage (SQLite) | 2 days | High |
-| Pluggable Scheduler Policies | 3 days | Medium |
-| Sub-Agent Orchestration DSL | 5 days | High |
-| Secure .aapp Signing | 2 days | Medium |
-| Rate Limiting and QoS | 1 day | Medium |
-| OpenTelemetry Instrumentation | 2 days | Low |
-| Kubernetes Operator | 3 days | Medium |
-| Structured Audit Export | 2 days | Medium |
-| Token Accounting with Real Models | 1 day | High |
+| Feature | Status |
+|---------|--------|
+| Phase 10 — Decentralized Cognitive Grids | ✓ Complete |
+| Persistent Storage (SQLite) | Planned |
+| Pluggable Scheduler Policies | Planned |
+| Sub-Agent Orchestration DSL | Planned |
+| Secure .aapp Signing | Planned |
+| Rate Limiting and QoS | Planned |
+| OpenTelemetry Instrumentation | Planned |
+| Kubernetes Operator | Planned |
+| Structured Audit Export | Planned |
+| Token Accounting with Real Models | Planned |
 
 ---
 
@@ -280,6 +325,26 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 We welcome contributions from architects, engineers, and researchers working on neuro-symbolic systems, cognitive computing, and agent orchestration.
 
 ### Getting Started
+
+#### Docker (Recommended)
+
+```bash
+docker compose up --build -d
+curl http://localhost:7400/health
+```
+
+Full API docs: [API_REFERENCE.md](API_REFERENCE.md)  
+Deployment guide: [SYS_DEV_GUIDE.md — Deployment](SYS_DEV_GUIDE.md#deployment)
+
+#### Bare Metal / VM
+
+```bash
+cd agos-kernel
+cargo build --release --features "z3-solver,wasm-sandbox,embodiment"
+RUST_LOG=info ./target/release/agos-kernel
+```
+
+See [SYS_DEV_GUIDE.md](SYS_DEV_GUIDE.md) for systemd service setup, VM provisioning, and configuration.
 
 1. **Fork** the repository.
 2. **Clone** your fork:
@@ -334,9 +399,8 @@ We welcome contributions from architects, engineers, and researchers working on 
 
 | Area | Skill Needed | Complexity |
 |------|-------------|------------|
-| SMT solver integration (Z3) | Formal methods, Rust | Hard |
-| WebAssembly tool sandbox | WASM, Rust, security | Hard |
-| Episodic compression daemon | Systems programming, Rust | Medium |
+| Embodiment VLA drivers (ROS2, robot arms) | Robotics, Rust | Hard |
+| Decentralized Cognitive Grids | Distributed systems, Rust | Hard |
 | Additional UMI drivers (OpenAI, Anthropic, local GGUF) | Rust, API design | Medium |
 | `.aapp` marketplace API | Java, REST, Spring Boot | Medium |
 | Kubernetes deployment manifests | DevOps, K8s | Easy |

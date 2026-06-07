@@ -10,7 +10,7 @@ pub struct AuditEntry {
     pub timestamp: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Constraint {
     pub field: String,
     pub operator: String,
@@ -20,6 +20,12 @@ pub struct Constraint {
 
 pub struct SMTSolver {
     constraints: std::sync::RwLock<Vec<Constraint>>,
+}
+
+impl Default for SMTSolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SMTSolver {
@@ -42,6 +48,10 @@ impl SMTSolver {
             }
         }
         Ok(())
+    }
+
+    pub fn get_constraints(&self) -> Vec<Constraint> {
+        self.constraints.read().unwrap().clone()
     }
 }
 
@@ -105,13 +115,24 @@ fn evaluate_constraint(c: &Constraint, claim: &Value) -> bool {
 pub struct SecurityEngine {
     smt_solver: SMTSolver,
     audit_log: std::sync::RwLock<Vec<AuditEntry>>,
+    #[cfg(feature = "z3-solver")]
+    z3_solver: crate::z3_solver::Z3PolicySolver,
+}
+
+impl Default for SecurityEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SecurityEngine {
     pub fn new() -> Self {
-        let engine = SecurityEngine {
+        #[allow(unused_mut)]
+        let mut engine = SecurityEngine {
             smt_solver: SMTSolver::new(),
             audit_log: std::sync::RwLock::new(Vec::new()),
+            #[cfg(feature = "z3-solver")]
+            z3_solver: crate::z3_solver::Z3PolicySolver::new(),
         };
         engine.init_default_policies();
         engine
@@ -143,11 +164,28 @@ impl SecurityEngine {
         action_vector: &Value,
         permissions: &[String],
     ) -> Result<(), String> {
+        let action_str = action_vector
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let capability = action_vector
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target = action_vector
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let amount = action_vector
+            .get("amount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
         let claim = serde_json::json!({
-            "action": action_vector.get("action").and_then(|v| v.as_str()).unwrap_or(""),
-            "capability": action_vector.get("capability").and_then(|v| v.as_str()).unwrap_or(""),
-            "target": action_vector.get("target").and_then(|v| v.as_str()).unwrap_or(""),
-            "amount": action_vector.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            "action": action_str,
+            "capability": capability,
+            "target": target,
+            "amount": amount,
         });
 
         if let Err(msg) = self.smt_solver.check(&claim) {
@@ -160,10 +198,25 @@ impl SecurityEngine {
             return Err(msg);
         }
 
-        let action_str = action_vector
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        #[cfg(feature = "z3-solver")]
+        {
+            let constraints = self.smt_solver.get_constraints();
+            if let Err(msg) = self.z3_solver.verify(
+                action_str,
+                capability,
+                target,
+                amount,
+                &constraints,
+            ) {
+                self.audit_log.write().unwrap().push(AuditEntry {
+                    action: action_vector.clone(),
+                    result: "DENIED".to_string(),
+                    reason: msg.clone(),
+                    timestamp: Utc::now().to_rfc3339(),
+                });
+                return Err(msg);
+            }
+        }
 
         if !permissions.is_empty() {
             let allowed = permissions.iter().any(|perm| match_permission(action_str, perm));

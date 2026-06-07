@@ -1,0 +1,45 @@
+services:
+  agos-kernel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agos-kernel
+    ports:
+      - "7400:7400"
+    environment:
+      RUST_LOG: info
+    volumes:
+      - agos-data:/var/lib/agos/data
+      - ./agos-kernel/aapps:/var/lib/agos/aapps:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7400/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - agos-net
+
+  agos-demo:
+    build:
+      context: ./agos-demo
+      dockerfile: Dockerfile
+    container_name: agos-demo
+    ports:
+      - "8080:8080"
+    environment:
+      AGOS_KERNEL_URL: http://agos-kernel:7400
+    depends_on:
+      agos-kernel:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - agos-net
+
+volumes:
+  agos-data:
+
+networks:
+  agos-net:
+    driver: bridge

@@ -3,11 +3,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::auth::AuthConfig;
 use crate::cipc::CIPCBus;
+use crate::grid::CognitiveGrid;
 use crate::memory::HierarchicalMemoryManager;
 use crate::scheduler::{CognitiveProcessContext, TokenScheduler};
 use crate::security::SecurityEngine;
 use crate::umi::UnifiedModelInterface;
+
+#[cfg(feature = "embodiment")]
+use crate::embodiment::EmbodimentLayer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanicLog {
@@ -24,17 +29,25 @@ pub struct agOSKernel {
     pub cipc: CIPCBus,
     pub security: SecurityEngine,
     pub umi: UnifiedModelInterface,
+    pub grid: CognitiveGrid,
+    pub auth: std::sync::Mutex<AuthConfig>,
+    #[cfg(feature = "embodiment")]
+    pub embodiment: EmbodimentLayer,
     panic_log: std::sync::RwLock<Vec<PanicLog>>,
 }
 
 impl agOSKernel {
-    pub fn new(umi: UnifiedModelInterface) -> Self {
+    pub fn new(umi: UnifiedModelInterface, listen_addr: &str) -> Self {
         agOSKernel {
             scheduler: TokenScheduler::new(),
             memory: HierarchicalMemoryManager::new(),
             cipc: CIPCBus::new(),
             security: SecurityEngine::new(),
             umi,
+            grid: CognitiveGrid::new(listen_addr),
+            auth: std::sync::Mutex::new(AuthConfig::default()),
+            #[cfg(feature = "embodiment")]
+            embodiment: EmbodimentLayer::new(),
             panic_log: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -125,5 +138,60 @@ impl agOSKernel {
 
     pub fn hot_swap_umi(&self, driver_name: &str) -> Result<(), String> {
         self.umi.hot_swap(driver_name)
+    }
+
+    pub async fn migrate_process(
+        &self,
+        pid: &str,
+        target_node: &str,
+    ) -> Result<crate::grid::MigratingProcess, String> {
+        let ctx = self
+            .scheduler
+            .get_process(pid)
+            .await
+            .ok_or_else(|| format!("Process '{}' not found", pid))?;
+        let frozen = self.grid.freeze_process(&ctx);
+        self.kill_process(pid).await;
+        self.memory.log_episodic(
+            pid,
+            "PROCESS_MIGRATED_OUT",
+            serde_json::json!({
+                "pid": pid,
+                "target_node": target_node,
+                "source_node": self.grid.node_id(),
+            }),
+            None,
+        );
+        Ok(frozen)
+    }
+
+    pub async fn receive_process(
+        &self,
+        incoming: crate::grid::MigratingProcess,
+    ) -> CognitiveProcessContext {
+        let mut ctx = CognitiveProcessContext::new(incoming.pid.clone(), incoming.manifest);
+        ctx.token_quota = incoming.token_quota;
+        ctx.tokens_used = incoming.tokens_used;
+        ctx.priority = incoming.priority;
+        ctx.active_l1_context = incoming.active_l1_context;
+        ctx.state_machine = incoming.state_machine;
+        ctx.parent_pid = incoming.parent_pid;
+        ctx.goal_metric = incoming.goal_metric;
+        ctx.created_at = incoming.created_at;
+
+        self.scheduler.register(ctx.clone()).await;
+
+        self.memory.log_episodic(
+            &incoming.pid,
+            "PROCESS_MIGRATED_IN",
+            serde_json::json!({
+                "pid": &incoming.pid,
+                "source_node": &incoming.source_node,
+                "local_node": self.grid.node_id(),
+            }),
+            None,
+        );
+
+        ctx
     }
 }

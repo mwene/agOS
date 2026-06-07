@@ -19,7 +19,7 @@ impl SchemaValidator {
         if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
             for field in required {
                 if let Some(field_name) = field.as_str() {
-                    if !payload.get(field_name).is_some() {
+                    if payload.get(field_name).is_none() {
                         return false;
                     }
                 }
@@ -32,6 +32,12 @@ impl SchemaValidator {
 pub struct CIPCBus {
     messages: std::sync::RwLock<Vec<Message>>,
     route_permissions: std::sync::RwLock<std::collections::HashMap<String, Vec<String>>>,
+}
+
+impl Default for CIPCBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CIPCBus {

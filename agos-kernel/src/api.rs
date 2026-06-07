@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::{get, post},
     Json, Router,
 };
@@ -14,40 +16,89 @@ use crate::sandbox::{AAppLoader, InstallResult};
 
 type KernelState = Arc<agOSKernel>;
 
+fn require_auth(kernel: &agOSKernel, headers: &HeaderMap) -> Result<(), (axum::http::StatusCode, Json<Value>)> {
+    let auth = kernel.auth.lock().unwrap();
+    if auth.api_key.is_none() {
+        return Ok(());
+    }
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok());
+    if auth.check_api_key(api_key).is_err() {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Missing or invalid API key"})),
+        ));
+    }
+    Ok(())
+}
+
 pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_check))
         .route("/kernel/spawn", post(kernel_spawn))
         .route("/kernel/kill", post(kernel_kill))
         .route("/kernel/processes", get(kernel_processes))
-        .route("/kernel/process/{pid}", get(kernel_process))
+        .route("/kernel/process/:pid", get(kernel_process))
         .route("/kernel/panic", post(kernel_panic))
         .route("/memory/l1/write", post(memory_l1_write))
-        .route("/memory/l1/{pid}", get(memory_l1_read))
+        .route("/memory/l1/:pid", get(memory_l1_read))
         .route("/memory/l2/compress", post(memory_l2_compress))
         .route("/memory/vector", post(memory_vector_store))
         .route("/memory/page", post(memory_page_in))
         .route("/memory/stats", get(memory_stats))
         .route("/memory/episodic", get(memory_episodic))
+        .route("/memory/episodic/compress", post(memory_episodic_compress))
         .route("/cipc/route", post(cipc_route))
         .route("/cipc/history", get(cipc_history))
         .route("/security/verify", post(security_verify))
         .route("/security/audit", get(security_audit))
+        .route("/security/auth", post(security_auth_set))
+        .route("/security/auth/agent", post(security_auth_agent_token))
         .route("/umi/reason", post(umi_reason))
         .route("/umi/embed", post(umi_embed))
         .route("/umi/compress", post(umi_compress))
         .route("/umi/switch", post(umi_switch))
         .route("/umi/metrics", get(umi_metrics))
+        .route("/umi/drivers", get(umi_drivers))
+        .route("/umi/driver/info/:name", get(umi_driver))
+        .route("/umi/driver/download/:name", get(umi_driver_download))
+        .route("/umi/driver/config/:name", post(umi_driver_config))
+        .route("/umi/driver/register", post(umi_driver_register))
+        .route("/umi/driver/unregister", post(umi_driver_unregister))
         .route("/sandbox/install", post(sandbox_install))
         .route("/sandbox/launch", post(sandbox_launch))
-        .route("/sandbox/apps", get(sandbox_apps))
-        .layer(cors)
-        .with_state(kernel)
+        .route("/sandbox/apps", get(sandbox_apps));
+
+    #[cfg(feature = "wasm-sandbox")]
+    let router = router.route("/sandbox/execute", post(sandbox_wasm_execute));
+
+    #[cfg(feature = "embodiment")]
+    let router = router
+        .route("/embodiment/goal", post(embodiment_goal))
+        .route("/embodiment/goals", get(embodiment_goals))
+        .route("/embodiment/goal/:goal_id", get(embodiment_goal_status))
+        .route("/embodiment/goal/:goal_id/plan", get(embodiment_goal_plan))
+        .route("/embodiment/goal/:goal_id/clarify", post(embodiment_clarify))
+        .route("/embodiment/goal/:goal_id/execute", post(embodiment_execute))
+        .route("/embodiment/sensors", get(embodiment_sensors))
+        .route("/embodiment/apps", get(embodiment_apps));
+
+    let router = router
+        .route("/grid/join", post(grid_join))
+        .route("/grid/peers", get(grid_peers))
+        .route("/grid/stats", get(grid_stats))
+        .route("/grid/heartbeat", post(grid_heartbeat))
+        .route("/grid/migrate", post(grid_migrate))
+        .route("/grid/receive", post(grid_receive))
+        .route("/grid/cipc/forward", post(grid_cipc_forward));
+
+    router.layer(cors).with_state(kernel)
 }
 
 async fn health_check() -> Json<Value> {
@@ -199,6 +250,11 @@ async fn memory_episodic(State(kernel): State<KernelState>) -> Json<Value> {
     Json(serde_json::json!({"entries": entries, "count": entries.len()}))
 }
 
+async fn memory_episodic_compress(State(kernel): State<KernelState>) -> Json<Value> {
+    let count = kernel.memory.compress_episodic();
+    Json(serde_json::json!({"ok": true, "compressed": count}))
+}
+
 // ── cIPC ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -246,6 +302,45 @@ async fn security_audit(State(kernel): State<KernelState>) -> Json<Value> {
     let allowed = entries.iter().filter(|e| e.result == "ALLOWED").count();
     let denied = entries.iter().filter(|e| e.result == "DENIED").count();
     Json(serde_json::json!({"entries": entries, "count": entries.len(), "allowed": allowed, "denied": denied}))
+}
+
+#[derive(Deserialize)]
+struct SecurityAuthRequest {
+    api_key: String,
+}
+
+async fn security_auth_set(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SecurityAuthRequest>,
+) -> Json<Value> {
+    let mut auth = kernel.auth.lock().unwrap();
+    if req.api_key.is_empty() {
+        auth.api_key = None;
+        drop(auth);
+        return Json(serde_json::json!({"ok": true, "message": "API key authentication disabled."}));
+    }
+    auth.api_key = Some(req.api_key.clone());
+    drop(auth);
+    Json(serde_json::json!({
+        "ok": true,
+        "message": "API key authentication enabled. All endpoints except /health and /security/auth are now protected.",
+    }))
+}
+
+#[derive(Deserialize)]
+struct SecurityAgentTokenRequest {
+    agent_id: String,
+    token: String,
+}
+
+async fn security_auth_agent_token(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SecurityAgentTokenRequest>,
+) -> Json<Value> {
+    let mut auth = kernel.auth.lock().unwrap();
+    auth.agent_tokens.insert(req.agent_id.clone(), req.token.clone());
+    drop(auth);
+    Json(serde_json::json!({"ok": true, "agent_id": req.agent_id}))
 }
 
 // ── UMI ─────────────────────────────────────────────────────
@@ -319,6 +414,105 @@ async fn umi_metrics(State(kernel): State<KernelState>) -> Json<Value> {
         "metrics": metrics,
         "active_driver": kernel.umi.active_name(),
     }))
+}
+
+async fn umi_drivers(State(kernel): State<KernelState>) -> Json<Value> {
+    let drivers = kernel.umi.list_drivers();
+    Json(serde_json::json!({ "drivers": drivers, "count": drivers.len() }))
+}
+
+async fn umi_driver(
+    State(kernel): State<KernelState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    match kernel.umi.get_driver(&name) {
+        Some(info) => Json(serde_json::json!(info)),
+        None => Json(serde_json::json!({"error": format!("Driver '{}' not found", name)})),
+    }
+}
+
+#[derive(Deserialize)]
+struct RegisterDriverRequest {
+    name: String,
+    capability_level: u32,
+    #[serde(default = "default_token_cost")]
+    token_cost: u64,
+    #[serde(default = "default_prefix")]
+    prefix: String,
+    #[serde(default = "default_embed_modulus")]
+    embed_modulus: u64,
+    #[serde(default = "default_max_output")]
+    max_output: usize,
+    #[serde(default)]
+    config: HashMap<String, String>,
+}
+
+fn default_token_cost() -> u64 { 1 }
+fn default_prefix() -> String { "inferred".to_string() }
+fn default_embed_modulus() -> u64 { 10000 }
+fn default_max_output() -> usize { 10 }
+
+async fn umi_driver_register(
+    State(kernel): State<KernelState>,
+    Json(req): Json<RegisterDriverRequest>,
+) -> Json<Value> {
+    match kernel.umi.register_driver(
+        &req.name, req.capability_level, req.token_cost, &req.prefix,
+        req.embed_modulus, req.max_output, req.config,
+    ) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "name": req.name})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn umi_driver_unregister(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UnregisterDriverRequest>,
+) -> Json<Value> {
+    match kernel.umi.unregister_driver(&req.name) {
+        Ok(()) => Json(serde_json::json!({"ok": true})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn umi_driver_download(
+    State(kernel): State<KernelState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    if let Err((_status, body)) = require_auth(&kernel, &headers) {
+        return body;
+    }
+    let info = kernel.umi.get_driver(&name);
+    let config = kernel.umi.get_driver_config(&name);
+    match info {
+        Some(info) => Json(serde_json::json!({
+            "driver": info,
+            "config": config.unwrap_or_default(),
+        })),
+        None => Json(serde_json::json!({"error": format!("Driver '{}' not found", name)})),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateDriverConfigRequest {
+    config: HashMap<String, String>,
+}
+
+async fn umi_driver_config(
+    State(kernel): State<KernelState>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateDriverConfigRequest>,
+) -> Json<Value> {
+    match kernel.umi.update_driver_config(&name, req.config) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "name": name})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct UnregisterDriverRequest {
+    name: String,
 }
 
 // ── Sandbox ─────────────────────────────────────────────────
@@ -436,4 +630,269 @@ async fn sandbox_launch(
 
 async fn sandbox_apps() -> Json<Value> {
     Json(serde_json::json!({"apps": ["financial_auditor", "accountant"]}))
+}
+
+#[cfg(feature = "wasm-sandbox")]
+#[derive(Deserialize)]
+struct WasmExecuteRequest {
+    wasm_base64: String,
+    input: Value,
+    pid: String,
+    fuel_quota: Option<u64>,
+}
+
+#[cfg(feature = "wasm-sandbox")]
+async fn sandbox_wasm_execute(
+    State(kernel): State<KernelState>,
+    Json(req): Json<WasmExecuteRequest>,
+) -> Json<Value> {
+    use base64::Engine as _;
+
+    let wasm_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.wasm_base64) {
+        Ok(b) => b,
+        Err(e) => return Json(serde_json::json!({"error": format!("Base64 decode: {}", e)})),
+    };
+
+    let sandbox = match crate::sandbox_wasm::WasmSandbox::new() {
+        Ok(s) => s,
+        Err(e) => return Json(serde_json::json!({"error": e})),
+    };
+
+    let quota = req.fuel_quota.unwrap_or(100_000);
+    match sandbox.execute_tool(&wasm_bytes, &req.input, &kernel, &req.pid, quota) {
+        Ok(result) => Json(serde_json::json!({"ok": true, "result": result})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+// ── Embodiment (VLA Driver Pipeline) ────────────────────────
+
+#[cfg(feature = "embodiment")]
+#[derive(Deserialize)]
+struct EmbodimentGoalRequest {
+    statement: String,
+    sensory_inputs: Option<Vec<EmbodimentSensoryInput>>,
+}
+
+#[cfg(feature = "embodiment")]
+#[derive(Deserialize)]
+struct EmbodimentSensoryInput {
+    modality: String,
+    data: String,
+    metadata: Option<Value>,
+}
+
+#[cfg(feature = "embodiment")]
+#[derive(Deserialize)]
+struct EmbodimentClarifyRequest {
+    clarification: String,
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_goal(
+    State(kernel): State<KernelState>,
+    Json(req): Json<EmbodimentGoalRequest>,
+) -> Json<Value> {
+    use crate::embodiment::SenseModality;
+
+    let sensory_inputs = match req.sensory_inputs {
+        Some(inputs) => inputs
+            .into_iter()
+            .filter_map(|si| {
+                let modality = match si.modality.to_lowercase().as_str() {
+                    "text" => Some(SenseModality::Text),
+                    "image" => Some(SenseModality::Image),
+                    "audio" => Some(SenseModality::Audio),
+                    "video" => Some(SenseModality::Video),
+                    "haptic" => Some(SenseModality::Haptic),
+                    "olfactory" => Some(SenseModality::Olfactory),
+                    "gustatory" => Some(SenseModality::Gustatory),
+                    _ => None,
+                }?;
+                Some(kernel.embodiment.process_sensory_input(
+                    modality,
+                    &si.data,
+                    si.metadata.unwrap_or(Value::Null),
+                ))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let goal = kernel
+        .embodiment
+        .submit_goal(&req.statement, sensory_inputs, &kernel);
+
+    let plan = kernel
+        .embodiment
+        .run_pipeline(&goal.id, &kernel)
+        .await
+        .ok();
+
+    Json(serde_json::json!({
+        "goal": goal,
+        "plan": plan,
+    }))
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_goals(State(kernel): State<KernelState>) -> Json<Value> {
+    let goals = kernel.embodiment.list_goals();
+    Json(serde_json::json!({"goals": goals, "count": goals.len()}))
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_goal_status(
+    State(kernel): State<KernelState>,
+    Path(goal_id): Path<String>,
+) -> Json<Value> {
+    match kernel.embodiment.get_goal(&goal_id) {
+        Some(goal) => Json(serde_json::json!({"goal": goal})),
+        None => Json(serde_json::json!({"error": "Goal not found"})),
+    }
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_goal_plan(
+    State(kernel): State<KernelState>,
+    Path(goal_id): Path<String>,
+) -> Json<Value> {
+    match kernel.embodiment.get_plan(&goal_id) {
+        Some(plan) => Json(serde_json::json!({"plan": plan})),
+        None => Json(serde_json::json!({"error": "No plan found for goal"})),
+    }
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_clarify(
+    State(kernel): State<KernelState>,
+    Path(goal_id): Path<String>,
+    Json(req): Json<EmbodimentClarifyRequest>,
+) -> Json<Value> {
+    match kernel
+        .embodiment
+        .provide_clarification(&goal_id, &req.clarification, &kernel)
+        .await
+    {
+        Ok(plan) => Json(serde_json::json!({"ok": true, "plan": plan})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_execute(
+    State(kernel): State<KernelState>,
+    Path(goal_id): Path<String>,
+) -> Json<Value> {
+    match kernel.embodiment.execute_plan(&goal_id, &kernel).await {
+        Ok(()) => {
+            let goal = kernel.embodiment.get_goal(&goal_id);
+            Json(serde_json::json!({"ok": true, "goal": goal}))
+        }
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_sensors(State(kernel): State<KernelState>) -> Json<Value> {
+    let sensors = kernel.embodiment.available_sensors();
+    let sensor_names: Vec<&str> = sensors
+        .iter()
+        .map(|s| match s {
+            crate::embodiment::SenseModality::Text => "text",
+            crate::embodiment::SenseModality::Image => "image",
+            crate::embodiment::SenseModality::Audio => "audio",
+            crate::embodiment::SenseModality::Video => "video",
+            crate::embodiment::SenseModality::Haptic => "haptic",
+            crate::embodiment::SenseModality::Olfactory => "olfactory",
+            crate::embodiment::SenseModality::Gustatory => "gustatory",
+        })
+        .collect();
+    Json(serde_json::json!({"sensors": sensor_names}))
+}
+
+#[cfg(feature = "embodiment")]
+async fn embodiment_apps(State(kernel): State<KernelState>) -> Json<Value> {
+    let apps = kernel.embodiment.list_agent_apps();
+    Json(serde_json::json!({"apps": apps}))
+}
+
+// ── Grid ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GridJoinRequest {
+    node_id: String,
+    address: String,
+}
+
+async fn grid_join(
+    State(kernel): State<KernelState>,
+    Json(req): Json<GridJoinRequest>,
+) -> Json<Value> {
+    kernel.grid.add_peer(req.node_id.clone(), req.address);
+    Json(serde_json::json!({"ok": true, "node_id": kernel.grid.node_id()}))
+}
+
+async fn grid_peers(State(kernel): State<KernelState>) -> Json<Value> {
+    let peers = kernel.grid.list_peers();
+    Json(serde_json::json!({"peers": peers, "count": peers.len()}))
+}
+
+async fn grid_stats(State(kernel): State<KernelState>) -> Json<Value> {
+    let stats = kernel.grid.stats();
+    Json(serde_json::json!({"stats": stats}))
+}
+
+#[derive(Deserialize)]
+struct GridHeartbeatRequest {
+    node_id: String,
+}
+
+async fn grid_heartbeat(
+    State(kernel): State<KernelState>,
+    Json(req): Json<GridHeartbeatRequest>,
+) -> Json<Value> {
+    kernel.grid.record_heartbeat(&req.node_id);
+    Json(serde_json::json!({"ok": true, "local_node_id": kernel.grid.node_id()}))
+}
+
+#[derive(Deserialize)]
+struct GridMigrateRequest {
+    pid: String,
+    target_node: String,
+}
+
+async fn grid_migrate(
+    State(kernel): State<KernelState>,
+    Json(req): Json<GridMigrateRequest>,
+) -> Json<Value> {
+    match kernel.migrate_process(&req.pid, &req.target_node).await {
+        Ok(frozen) => Json(serde_json::json!({"ok": true, "frozen": frozen})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn grid_receive(
+    State(kernel): State<KernelState>,
+    Json(incoming): Json<crate::grid::MigratingProcess>,
+) -> Json<Value> {
+    let ctx = kernel.receive_process(incoming).await;
+    Json(serde_json::json!({"ok": true, "pid": ctx.pid}))
+}
+
+#[derive(Deserialize)]
+struct GridCipcForwardRequest {
+    from: String,
+    to: String,
+    payload: Value,
+}
+
+async fn grid_cipc_forward(
+    State(kernel): State<KernelState>,
+    Json(req): Json<GridCipcForwardRequest>,
+) -> Json<Value> {
+    match kernel.cipc.route(&req.from, &req.to, req.payload) {
+        Ok(msg) => Json(serde_json::json!({"ok": true, "message_id": msg.id})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
 }

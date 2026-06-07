@@ -16,8 +16,12 @@ This guide covers the internal architecture, module interfaces, concurrency mode
   - [cipc.rs — CIPCBus](#cipcrs--cipcbus)
   - [security.rs — SecurityEngine + SMTSolver](#securityrs--securityengine--smtsolver)
   - [umi.rs — UnifiedModelInterface](#umirs--unifiedmodelinterface)
-  - [sandbox.rs — AAppLoader](#sandboxrs--aapploader)
-  - [api.rs — REST Router](#apirs--rest-router)
+   - [sandbox.rs — AAppLoader](#sandboxrs--aapploader)
+   - [z3_solver.rs — Z3PolicySolver](#z3_solversr--z3policysolver)
+   - [sandbox_wasm.rs — WasmSandbox](#sandbox_wasmrs--wasmsandbox)
+   - [embodiment.rs — EmbodimentLayer](#embodimentrs--embodimentlayer)
+   - [grid.rs — CognitiveGrid](#gridrs--cognitifrid)
+   - [api.rs — REST Router](#apirs--rest-router)
 - [Concurrency Model](#concurrency-model)
 - [Adding a New Kernel Subsystem](#adding-a-new-kernel-subsystem)
 - [Adding a New REST Endpoint](#adding-a-new-rest-endpoint)
@@ -38,18 +42,22 @@ This guide covers the internal architecture, module interfaces, concurrency mode
     │     ├── scheduler.rs  ────── TokenScheduler
     │     ├── memory.rs     ────── HierarchicalMemoryManager
     │     ├── cipc.rs       ────── CIPCBus
-    │     ├── security.rs   ────── SecurityEngine + SMTSolver
+    │     ├── security.rs   ────── SecurityEngine + SMTSolver (+ Z3PolicySolver with feature)
     │     ├── umi.rs        ────── UnifiedModelInterface
+    │     ├── grid.rs       ────── CognitiveGrid (always compiled)
+    │     ├── embodiment.rs ────── EmbodimentLayer (feature: embodiment)
     │     └── panic_log     ────── RwLock<Vec<PanicLog>>
     │
     └── create_router (api.rs)
           ├── /health
           ├── /kernel/*       (5 endpoints)
-          ├── /memory/*       (7 endpoints)
+          ├── /memory/*       (8 endpoints)
           ├── /cipc/*         (2 endpoints)
           ├── /security/*     (2 endpoints)
           ├── /umi/*          (6 endpoints)
-          └── /sandbox/*      (3 endpoints)
+          ├── /sandbox/*      (3+1 endpoints, +1 with wasm-sandbox)
+          ├── /embodiment/*   (8 endpoints, feature: embodiment)
+          └── /grid/*         (7 endpoints, always on)
 ```
 
 Each kernel subsystem is an independent struct that is composed into `agOSKernel`. Subsystems do not call each other directly — all coordination happens through `kernel.rs` methods or through the REST handlers in `api.rs`.
@@ -65,6 +73,10 @@ Each kernel subsystem is an independent struct that is composed into `agOSKernel
 | `umi` | `AtomicU32` (driver index) | `AtomicU32` | Lock-free |
 | `kernel` | `Vec<PanicLog>` | `std::sync::RwLock` | std::sync::RwLock |
 | `sandbox` | Stateless (filesystem reads) | — | — |
+| `z3_solver` | `Context + Solver (behind Mutex)` | — | std::sync::Mutex |
+| `sandbox_wasm` | `wasmtime::Engine` | — | — (Engine is Send+Sync) |
+| `grid` | HashMap<String, PeerInfo>, Vec<GridMessage> | std::sync::Mutex | std::sync::Mutex |
+| `embodiment` | `HashMap<String, EmbodimentGoal>` + `HashMap<String, ActionPlan>` | `std::sync::Mutex` | std::sync::Mutex |
 
 ---
 
@@ -91,6 +103,9 @@ Each kernel subsystem is an independent struct that is composed into `agOSKernel
                          │
                          ▼
                    ┌──────────┐
+                   │  grid    │  ← always compiled, no feature gate
+                   └──────────┘
+                   ┌──────────┐
                    │DriverState│
                    │ (statics) │
                    └──────────┘
@@ -113,18 +128,24 @@ main()
   │     └─ AtomicU32 set to DRIVER_LOCAL (0)
   │     └─ Static drivers already compiled: LOCAL_DRIVER, CLOUD_DRIVER
   │
-  ├─ 3. agOSKernel::new(umi)
-  │     ├─ TokenScheduler::new()        — empty process vec
+  ├─ 3. agOSKernel::new(umi, "127.0.0.1:7400")
+  │     ├─ TokenScheduler::new()            — empty process vec
   │     ├─ HierarchicalMemoryManager::new() — empty all stores
-  │     ├─ CIPCBus::new()               — empty msg log + route map
-  │     ├─ SecurityEngine::new()         — init_default_policies()
+  │     ├─ CIPCBus::new()                   — empty msg log + route map
+  │     ├─ SecurityEngine::new()            — init_default_policies()
   │     │   └─ SMTSolver::new()
   │     │   └─ Adds 3 constraints: blocked_actions, no_escalation, no_financial_transfer
+  │     │   └─ (with feature z3-solver: wraps Z3PolicySolver in Mutex for Stage 1)
+  │     ├─ CognitiveGrid::new(listen_addr)  — sets node_id from address
   │     ├─ umi (passed in)
+  │     ├─ (with feature embodiment: EmbodimentLayer::new())
   │     └─ panic_log: empty Vec
   │
   ├─ 4. create_router(kernel)
-  │     └─ axum::Router with 25 routes
+  │     └─ axum::Router with core routes
+  │     └─ (with feature wasm-sandbox: + POST /sandbox/execute)
+  │     └─ (with feature embodiment: + 8 /embodiment/* routes)
+  │     └─ 7 /grid/* routes (always compiled)
   │     └─ CORS layer (allow all origins/methods/headers)
   │
   ├─ 5. tokio::net::TcpListener::bind("127.0.0.1:7400")
@@ -148,6 +169,7 @@ pub struct agOSKernel {
     pub cipc: CIPCBus,
     pub security: SecurityEngine,
     pub umi: UnifiedModelInterface,
+    pub grid: CognitiveGrid,
     panic_log: RwLock<Vec<PanicLog>>,
 }
 ```
@@ -161,6 +183,8 @@ pub struct agOSKernel {
 | `kernel_panic(pid, reason)` | Unregisters process, flushes L1, broadcasts alert, logs panic | scheduler, memory |
 | `broadcast_alert(pid, msg)` | Writes CRITICAL severity event to episodic ledger | memory |
 | `hot_swap_umi(driver_name)` | Delegates to umi.hot_swap() | umi |
+| `migrate_process(pid, target_node)` | Freezes via grid, kills local, logs migration | scheduler, memory, grid |
+| `receive_process(incoming)` | Unfreezes via grid, registers on scheduler, logs receipt | scheduler, grid |
 
 #### Panic Flow
 
@@ -508,9 +532,160 @@ To support a compressed binary format (tar.gz or custom), add a new method `load
 
 ---
 
-### api.rs — REST Router
+### embodiment.rs — EmbodimentLayer
 
-The router is built in `create_router(kernel)`:
+The Embodiment Layer implements the VLA (Vision-Language-Action) pipeline — processing multimodal user goals through Perception → Understanding → Planning → Execution → Feedback stages.
+
+```rust
+pub struct EmbodimentLayer {
+    goals: Mutex<HashMap<String, EmbodimentGoal>>,
+    active_plans: Mutex<HashMap<String, ActionPlan>>,
+}
+```
+
+#### Key Types
+
+```rust
+pub enum SenseModality { Text, Image, Audio, Video, Haptic, Olfactory, Gustatory }
+
+pub struct EmbodimentGoal {
+    pub id: String,
+    pub original_statement: String,
+    pub supporting_inputs: Vec<SensoryInput>,
+    pub parsed_intent: String,
+    pub clarification_rounds: u32,
+    pub needs_clarification: bool,
+    pub status: GoalStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub struct ActionPlan {
+    pub goal_id: String,
+    pub tasks: Vec<PipelineTask>,
+    pub requires_clarification: Vec<String>,
+    pub suggested_apps: Vec<String>,
+}
+```
+
+#### Pipeline Flow
+
+```
+submit_goal(statement, sensory_inputs)
+  │
+  ├── GoalStatus::Received
+  │
+  └── run_pipeline(goal_id)
+        ├── Understanding (UMI SYS_REASON)
+        ├── Planning (create_plan)
+        ├── If empty tasks → NeedsClarification (up to 3 rounds)
+        └── Executing
+              └── execute_plan → spawn_process per task
+```
+
+#### Key Methods
+
+| Method | Async? | Description |
+|--------|--------|-------------|
+| `submit_goal()` | no | Creates goal, logs episodic event |
+| `run_pipeline()` | yes | Full P-U-P-E pipeline using UMI |
+| `execute_plan()` | yes | Spawns sub-agents for each task |
+| `provide_clarification()` | yes | Accepts clarification, re-plans |
+| `process_sensory_input()` | no | Wraps raw data into typed SensoryInput |
+| `available_sensors()` | no | Returns all 7 SenseModality variants |
+| `list_agent_apps()` | no | Returns known .aapp package names |
+
+#### Feature Gate
+
+- Feature: `embodiment` (no external dependency, just the module).
+- Field: `pub embodiment: EmbodimentLayer` on `agOSKernel` behind `#[cfg(feature = "embodiment")]`.
+- Routes: 8 endpoints under `/embodiment/*` behind `#[cfg(feature = "embodiment")]`.
+- No effect when feature is disabled — kernel builds and runs unchanged.
+
+#### Testing
+
+```bash
+cargo test --features embodiment
+# 22 embodiment tests + 9 memory tests = 31 total
+```
+
+---
+
+### grid.rs — CognitiveGrid
+
+The Grid module implements **decentralised multi-node agent orchestration** — peer discovery, heartbeat liveness tracking, and agent migration. Unlike optional subsystems (Z3, WASM, Embodiment), the grid is **always compiled** (no feature gate).
+
+#### Internal State
+
+```rust
+pub struct CognitiveGrid {
+    node_id: String,
+    peers: Mutex<HashMap<String, PeerInfo>>,
+    messages: Mutex<Vec<GridMessage>>,
+}
+```
+
+`PeerInfo` tracks the health and address of each peer:
+```rust
+pub struct PeerInfo {
+    pub node_id: String,
+    pub address: String,
+    pub status: PeerStatus,
+    pub last_seen: String,   // RFC 3339 timestamp
+}
+pub enum PeerStatus { Online, Stale, Offline }
+```
+
+#### Key Types
+
+| Type | Role |
+|------|------|
+| `MigratingProcess` | Serialized process payload — `{ pid, agent_app, state }` |
+| `GridMessage` | Internal message log enum — `Join`, `Heartbeat`, `Migrate`, etc. |
+| `GridStats` | `{ peer_count: usize, message_count: u64 }` |
+| `ResolveResult` | `{ Local, Remote(node_id) }` — for PID ownership lookup |
+
+#### Key Methods
+
+| Method | Locking | Description |
+|--------|---------|-------------|
+| `new(listen_addr)` | — | Sets `node_id` from the listen address |
+| `node_id()` | — | Returns the node's identifier |
+| `add_peer(id, addr)` | Mutex write | Adds or updates peer entry |
+| `list_peers()` | Mutex read | Returns all `PeerInfo` |
+| `remove_peer(id)` | Mutex write | Drops peer by node ID |
+| `record_heartbeat(id)` | Mutex write | Updates `last_seen` and sets status to `Online` |
+| `stale_peers(threshold_secs)` | Mutex read | Returns peers with `last_seen` older than threshold |
+| `freeze_process(pid, ctx, app)` | — | Creates `MigratingProcess` from local state |
+| `receive_process(incoming)` | — | Deserializes a `MigratingProcess` into a `CognitiveProcessContext` |
+| `resolve_pid(pid)` | Mutex read | Checks peers for PID ownership; returns Local or Remote |
+| `stats()` | Mutex read | Returns `GridStats` |
+
+#### Concurrency
+
+Uses `std::sync::Mutex` for `peers` and `messages`. Lock duration is negligible (HashMap insert/lookup/filter) — no `.await` held across the lock. The `Mutex` could be replaced with a `RwLock` if concurrent reads become a bottleneck.
+
+#### Integration with Kernel
+
+The kernel owns the grid and exposes two high-level operations:
+- `migrate_process(pid, target_node)` — calls `grid.freeze_process()`, logs `PROCESS_MIGRATED` to episodic memory, kills the local process
+- `receive_process(incoming)` — calls `grid.receive_process()`, registers the PID on the scheduler, logs `PROCESS_RECEIVED`
+
+The kernel constructor now requires a `listen_addr: &str` to initialize the grid:
+```rust
+pub fn new(umi: UnifiedModelInterface, listen_addr: &str) -> Self
+```
+
+#### Testing
+
+```bash
+cargo test -- grid
+# 9 tests: add/list/remove peers, heartbeat, stale detection, freeze/receive, PID resolution, stats
+```
+
+---
+
+### api.rs — REST Router
 
 ```rust
 pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
@@ -553,11 +728,13 @@ async fn handler_name(
 |--------|-------|-------|
 | `/health` | 1 | GET only, no auth |
 | `/kernel/*` | 5 | spawn, kill, list, get, panic |
-| `/memory/*` | 7 | l1 write/read, l2 compress, vector store, page-in, stats, episodic |
+| `/memory/*` | 8 | l1 write/read, l2 compress, vector store, page-in, stats, episodic, episodic/compress |
 | `/cipc/*` | 2 | route, history |
 | `/security/*` | 2 | verify, audit |
 | `/umi/*` | 6 | reason, embed, compress, switch, metrics |
-| `/sandbox/*` | 3 | install, launch, apps |
+| `/sandbox/*` | 3 + 1 | install, launch, apps (+ execute with wasm-sandbox feature) |
+| `/embodiment/*` | 8 | goal, goals, status, plan, clarify, execute, sensors, apps (with embodiment feature) |
+| `/grid/*` | 7 | join, peers, stats, heartbeat, migrate, receive, cipc/forward (always compiled) |
 
 ---
 
@@ -650,7 +827,7 @@ pub struct agOSKernel {
 }
 
 impl agOSKernel {
-    pub fn new(umi: UnifiedModelInterface) -> Self {
+    pub fn new(umi: UnifiedModelInterface, listen_addr: &str) -> Self {
         agOSKernel {
             // ... existing initializations ...
             registry: ServiceRegistry::new(),
@@ -791,12 +968,18 @@ if condition {
 | `chrono` | 0.4 (serde) | Timestamps (RFC 3339) |
 | `tower` | 0.5 | Service layer for axum |
 | `async-trait` | 0.1 | (Reserved for future async trait use) |
+| `z3` | 0.7 (optional) | Z3 SMT solver integration |
+| `wasmtime` | 45 (optional) | WebAssembly runtime for sandbox tool execution |
+| `base64` | 0.22 (optional) | Base64 decode for WASM binary upload |
 
 ### Build Commands
 
 ```bash
-# Build (debug)
+# Build (debug, default features)
 cargo build
+
+# Build with optional features
+cargo build --features "z3-solver,wasm-sandbox,embodiment"
 
 # Build (release)
 cargo build --release
@@ -810,8 +993,11 @@ cargo clippy
 # Format code
 cargo fmt
 
-# Run all tests
+# Run all tests (default features)
 cargo test
+
+# Run all tests with all features
+cargo test --features "z3-solver,wasm-sandbox,embodiment"
 ```
 
 ### Logging
@@ -870,7 +1056,20 @@ Each subsystem has `#[cfg(test)] mod tests` covering:
 - Permission matching (wildcards, exact matches, rejections)
 
 ```bash
+# Default features (9 memory tests + 9 grid tests = 18 tests)
 cargo test
+
+# With z3-solver (+4 = 22 tests)
+cargo test --features z3-solver
+
+# With wasm-sandbox (+2 = 20 tests)
+cargo test --features wasm-sandbox
+
+# With embodiment (+22 = 40 tests)
+cargo test --features embodiment
+
+# All features (46 tests: 22 embodiment + 9 memory + 2 sandbox + 4 Z3 + 9 grid)
+cargo test --features "z3-solver,wasm-sandbox,embodiment"
 ```
 
 Example test structure (from the pattern in each module):
@@ -932,7 +1131,11 @@ All 28 steps must pass with no failures. The demo is the CI gate.
 
 | Term | Definition |
 |------|------------|
+| **Figure of Speech** | Heuristic detection of idioms/metaphors in goal statements (20+ patterns) |
+| **Semantic Ambiguity** | Flagged when a goal phrase has multiple possible meanings; resolved via UMI or user clarification |
+| **Grid** | Decentralised peer-to-peer network of agOS nodes — discovery, heartbeat, migration |
 | **cIPC** | Cognitive Inter-Process Communication — structured message bus between agents |
+| **Embodiment** | The VLA pipeline layer — multimodal goal processing, sensory input, sub-agent orchestration |
 | **L1** | Level 1 memory — active context window, per-process |
 | **L2** | Level 2 memory — compressed graph cache, per-process |
 | **PID** | Process ID — unique identifier for each agent instance |
@@ -940,6 +1143,101 @@ All 28 steps must pass with no failures. The demo is the CI gate.
 | **SMT** | Satisfiability Modulo Theories — constraint satisfaction solver |
 | **Syscall** | A UMI system call (REASON, EMBED, COMPRESS, SWITCH) |
 | **UMI** | Unified Model Interface — driver abstraction layer for AI models |
+| **VLA** | Vision-Language-Action — pipeline bridging perception, reasoning, and physical action |
+| **WASM** | WebAssembly — sandboxed execution environment for untrusted tool code |
 | **System 1** | Priority ≤ 1 processes (reflexive, fast, lower resource share) |
 | **System 2** | Priority ≥ 2 processes (deliberate, deep reasoning, higher resource share) |
 | **.aapp** | Agentic Application package — declarative agent blueprint |
+
+---
+
+## Deployment
+
+agOS can be deployed in three environments: **bare-metal**, **virtual machine**, and **Docker container**.
+
+### Prerequisites (all environments)
+
+- Linux x86_64 (recommended) or macOS arm64
+- 512 MB RAM minimum, 2 GB recommended
+- Network interface on port 7400 (configurable in `main.rs`)
+
+### Bare-Metal
+
+```bash
+# 1. Install Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. Build with all features
+cd agos-kernel
+cargo build --release --features "z3-solver,wasm-sandbox,embodiment"
+
+# 3. Create data directories
+mkdir -p /var/lib/agos/aapps /var/lib/agos/data
+
+# 4. Run
+RUST_LOG=info ./target/release/agos-kernel
+
+# Optional: install as systemd service
+cat > /etc/systemd/system/agos-kernel.service << 'EOF'
+[Unit]
+Description=agOS Kernel
+After=network.target
+
+[Service]
+Type=simple
+User=agos
+Group=agos
+WorkingDirectory=/var/lib/agos
+ExecStart=/usr/local/bin/agos-kernel
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now agos-kernel
+```
+
+### Virtual Machine
+
+1. Provision a Linux VM (Debian 12 Bookworm or Ubuntu 24.04 LTS recommended).
+2. Follow the Bare-Metal steps above inside the VM.
+3. **Port forwarding** (if using Vagrant):
+   ```ruby
+   # Vagrantfile
+   config.vm.network "forwarded_port", guest: 7400, host: 7400
+   ```
+4. **Security group** (cloud VMs): open TCP port 7400 for the kernel API.
+
+### Docker
+
+```bash
+# Build and run with docker-compose (includes demo)
+docker compose up --build -d
+
+# Or build and run the kernel standalone
+docker build -t agos-kernel .
+docker run -d --name agos-kernel -p 7400:7400 agos-kernel
+
+# Verify
+curl http://localhost:7400/health
+```
+
+The `Dockerfile` uses a multi-stage build (Rust builder → Debian slim runtime) and the `docker-compose.yml` includes:
+- agOS Kernel on port 7400
+- agOS Demo (Spring Boot) on port 8080
+- Shared Docker network for inter-container communication
+- Persistent volume for kernel data
+- Health checks on both services
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RUST_LOG` | `info` | Logging level (`trace`, `debug`, `info`, `warn`, `error`) |
+| listen address | `127.0.0.1:7400` | Kernel HTTP API address (hard-coded in `main.rs`) |
+
+Authentication and API keys are configured at runtime via `POST /security/auth` (see [API Reference](API_REFERENCE.md)).

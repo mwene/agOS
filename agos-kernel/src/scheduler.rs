@@ -79,6 +79,12 @@ pub struct TokenScheduler {
     processes: Arc<RwLock<Vec<CognitiveProcessContext>>>,
 }
 
+impl Default for TokenScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenScheduler {
     pub fn new() -> Self {
         TokenScheduler {
@@ -106,11 +112,7 @@ impl TokenScheduler {
         F: FnOnce(&mut CognitiveProcessContext) -> R,
     {
         let mut procs = self.processes.write().await;
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            Some(f(p))
-        } else {
-            None
-        }
+        procs.iter_mut().find(|p| p.pid == pid).map(f)
     }
 
     pub async fn allocate_inference(

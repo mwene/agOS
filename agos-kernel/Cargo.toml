@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "agOS (Agentic Operating System) – Cognitive Kernel"
 
+[features]
+default = []
+z3-solver = ["dep:z3"]
+wasm-sandbox = ["dep:wasmtime", "dep:base64"]
+embodiment = []
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -18,3 +24,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 tower = "0.5"
 async-trait = "0.1"
+z3 = { version = "0.7", optional = true }
+wasmtime = { version = "45", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+wat = "1"

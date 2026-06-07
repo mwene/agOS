@@ -12,10 +12,10 @@ This guide documents all 10 phases of the agOS development roadmap — **Phases 
 - [Phase 4 — Ring 0 Neuro-Symbolic Guard Layer](#phase-4--ring-0-neuro-symbolic-guard-layer)
 - [Phase 5 — Sandbox Installer + Integration Smoke Test](#phase-5--sandbox-installer--integration-smoke-test)
 - [Phase 6 — Episodic Compression Daemon](#phase-6--episodic-compression-daemon)
-- [Phase 7 — Native Z3 SMT Solver](#phase-7--native-z3-smt-solver)
-- [Phase 8 — WebAssembly Sandbox](#phase-8--webassembly-sandbox)
-- [Phase 9 — Embodiment Layer (VLA Driver Pipeline)](#phase-9--embodiment-layer-vla-driver-pipeline)
-- [Phase 10 — Decentralized Cognitive Grids](#phase-10--decentralized-cognitive-grids)
+- [Phase 7 — Native Z3 SMT Solver (Completed)](#phase-7--native-z3-smt-solver)
+- [Phase 8 — WebAssembly Sandbox (Completed)](#phase-8--webassembly-sandbox)
+- [Phase 9 — Embodiment Layer (VLA Driver Pipeline) (Completed)](#phase-9--embodiment-layer-vla-driver-pipeline)
+- [Phase 10 — Decentralized Cognitive Grids (Completed)](#phase-10--decentralized-cognitive-grids)
 - [Additional Enhancements](#additional-enhancements)
   - [Persistent Storage (SQLite)](#persistent-storage-sqlite)
   - [Rate Limiting and QoS](#rate-limiting-and-qos)
@@ -616,148 +616,167 @@ The sandbox loader (`sandbox.rs`) loads `.wasm` files alongside `.json` tool sch
 
 ---
 
-## Phase 9 — Embodiment Layer (VLA Driver Pipeline)
+## Phase 9 — Embodiment Layer (VLA Driver Pipeline) (Completed)
 
 ### Motivation
 
-Agents should be able to control physical or simulated robots. The Embodiment Layer adds a **Vision-Language-Action (VLA) driver pipeline** that translates high-level agent intents (`"move arm to position X"`) into low-level motor commands via UMI-style drivers.
+Agents must bridge the gap between cognitive reasoning and real-world interaction. The asks.txt vision describes an agOS that can accept natural language, video, text, and sensory inputs (all 5 human senses), then build and orchestrate agents to achieve user goals. The Embodiment Layer implements this as a **VLA (Vision-Language-Action) driver pipeline** — a multimodal goal-processing workflow with perception, understanding, planning, execution, and feedback stages.
 
-### Design
+### What Was Built
 
-```
-  Agent
-   │  "pick up the cup"
-   ▼
-  ┌──────────────────────┐
-  │  EmbodimentOrchestrator │
-  │  ┌────────────────┐   │
-  │  │ VLA Driver     │   │  ← Router to specific robot backend
-  │  │ (UMI-like)     │   │
-  │  └────────────────┘   │
-  │  ┌────────────────┐   │
-  │  │ Kinematics      │   │  ← Inverse kinematics, collision detection
-  │  │ Simulator       │   │
-  │  └────────────────┘   │
-  │  ┌────────────────┐   │
-  │  │ Sensor Pipeline │   │  ← Camera, LiDAR, proprioception
-  │  └────────────────┘   │
-  └──────────────────────┘
-```
+- **`EmbodimentLayer`** (`src/embodiment.rs`) — orchestrates the full VLA pipeline:
+  - **`submit_goal()`** — accepts a natural language statement + optional sensory inputs (image, audio, video, haptic, olfactory, gustatory, text)
+  - **`run_pipeline()`** — async pipeline: Perception → Understanding (via UMI) → Planning → Execution
+  - **`provide_clarification()`** — if the plan needs disambiguation, accepts follow-up text and re-plans (up to 3 rounds). State validation guards reject calls on non-`NeedsClarification` goals. Round counter increments atomically. Status transitions correctly from `Understanding` → `Executing` or back to `NeedsClarification`. Each clarification event is logged to episodic memory.
+  - **`execute_plan()`** — spawns sub-agents for each task via `kernel.spawn_process()`, logs to episodic memory
+  - **`process_sensory_input()`** — wraps raw sensor data into typed `SensoryInput` structs
+  - **`available_sensors()`** — reports all 7 supported modalities
+  - **`list_agent_apps()`** — searches available `.aapp` packages for task composition
+  - **`detect_figures_of_speech()`** — heuristic scanner that flags 20+ English idioms/metaphors (`"pull the trigger"`, `"drill down"`, `"low-hanging fruit"`, etc.) plus modality-aware casual phrasing detection for voice/text inputs
+  - **`resolve_with_umi()`** — consults UMI *before* asking the user; parses `RESOLVED: "<phrase>" → <meaning>` from the model and marks ambiguities as `resolved_by: "umi"` vs `""`
+  - **`format_ambiguity_context()`** — produces `[Resolved]` / `[Unresolved]` prefixed strings so `create_plan()` can pass resolved items silently and only flag unresolved ones for clarification
 
-The layer introduces a new UMI syscall: `SYS_ACT`. While `SYS_REASON` returns text, `SYS_ACT` returns **action primitives** (joint angles, gripper position, velocity commands).
+- **New types**:
+  - `SemanticAmbiguity { phrase, meaning, context, resolved_by }`
+  - `FigureOfSpeechKind { pattern: str, interpretation: str, confidence: f64 }`
+  - `EmbodimentGoal.detected_ambiguities: Vec<SemanticAmbiguity>`
 
-### Implementation Steps
+- **Pipeline stages**:
+  ```
+  Goal text + sensory inputs
+          │
+          ▼
+  ┌────────────────────┐
+  │  1. Perception     │  ← Parse modalities, extract metadata
+  ├────────────────────┤
+  │  2. Understanding  │  ← detect_figures_of_speech → resolve_with_umi
+  ├────────────────────┤
+  │  3. Planning       │  ← create_plan (only flags [Unresolved] ambiguities)
+  ├────────────────────┤
+  │  4. Clarification  │  ← provide_clarification (state-guarded, round-capped)
+  ├────────────────────┤
+  │  5. Execution      │  ← Spawn sub-agents, monitor progress
+  ├────────────────────┤
+  │  6. Feedback       │  ← Log to episodic memory, return results
+  └────────────────────┘
+  ```
 
-1. **Create `src/embodiment.rs`**:
-   ```rust
-   pub struct EmbodimentOrchestrator {
-       active_driver: AtomicU32,
-   }
+- **REST endpoints** (behind `#[cfg(feature = "embodiment")]`):
+  | Endpoint | Method | Description |
+  |----------|--------|-------------|
+  | `/embodiment/goal` | POST | Submit a goal with optional sensory inputs |
+  | `/embodiment/goals` | GET | List all goals |
+  | `/embodiment/goal/{id}` | GET | Get goal status |
+  | `/embodiment/goal/{id}/plan` | GET | Get action plan |
+  | `/embodiment/goal/{id}/clarify` | POST | Provide clarification |
+  | `/embodiment/goal/{id}/execute` | POST | Execute plan |
+  | `/embodiment/sensors` | GET | List available sensors |
+  | `/embodiment/apps` | GET | List available agent apps |
 
-   pub enum ActionPrimitive {
-       MoveJoints { angles: Vec<f64>, speed: f64 },
-       MoveLinear { x: f64, y: f64, z: f64 },
-       Grip { force: f64 },
-       Wait { duration_secs: f64 },
-   }
+### Key Files
 
-   impl EmbodimentOrchestrator {
-       pub async fn act(&self, intent: &str, context: &Value) -> Result<Vec<ActionPrimitive>, String>;
-       pub fn hot_swap_driver(&self, name: &str) -> Result<(), String>;
-   }
-   ```
-
-2. **Add embodiment drivers**:
-   - `SimulatedArm` — returns predefined action primitives.
-   - `ROS2Driver` — publishes to ROS2 topics via `ros2-client` crate.
-   - `MoonshotVLA` — calls a remote VLA model API.
-
-3. **Register SYS_ACT as a UMI syscall** — extend `UnifiedModelInterface` with `act()` or create a parallel `EmbodimentInterface`.
-4. **Add REST endpoints**: `POST /embodiment/act`, `POST /embodiment/switch`.
-
-### Files to Modify
-
-| File | Change |
-|------|--------|
-| `agos-kernel/src/embodiment.rs` | New file |
-| `agos-kernel/src/lib.rs` | Add `pub mod embodiment` |
-| `agos-kernel/src/kernel.rs` | Add `EmbodimentOrchestrator` field |
-| `agos-kernel/src/api.rs` | Add `/embodiment/*` routes |
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/embodiment.rs` | `EmbodimentLayer`, goal/pipeline/plan types, figure-of-speech detection, UMI resolution |
+| `agos-kernel/src/lib.rs` | `pub mod embodiment` behind `embodiment` feature |
+| `agos-kernel/src/kernel.rs` | `pub embodiment: EmbodimentLayer` field |
+| `agos-kernel/src/api.rs` | 8 `/embodiment/*` routes behind cfg gate |
+| `agos-kernel/Cargo.toml` | `embodiment = []` feature flag |
 
 ### Testing
 
-- Unit: simulate a pick-and-place sequence, verify action primitives are well-formed.
-- Integration (with simulator): spawn an agent, send `"move to home"` intent, verify joint angles match expected.
+```bash
+# With feature flag:
+cargo test --features embodiment
+# 22 embodiment tests + 9 memory tests = 31 total
 
-### Open Questions
+# All features:
+cargo test --features "z3-solver,wasm-sandbox,embodiment"
+# 46 tests total (22 embodiment + 9 memory + 2 sandbox + 4 Z3 + 9 grid)
+```
 
-- Should `SYS_ACT` be a UMI syscall or a separate interface? (UMI = model inference, Embodiment = physical action — they may share a pipeline but differ in output type.)
-- How does the agent specify which robot? Via `manifest.json` or a runtime parameter?
-- Safety: how to enforce hardware limits (joint stops, force limits) in the pipeline?
+### Key Design Decisions
+
+- Feature-gated (`embodiment = []`) — zero overhead when disabled.
+- Sync `EmbodimentLayer` with `std::sync::Mutex` for internal state; pipeline methods are `async` because they call `UMI::reason()`.
+- Sensory inputs are abstract `String` payloads — actual encoding (base64 images, WAV audio) handled by the caller.
+- Agent app search returns known `.aapp` names — can be extended with real filesystem scanning.
+- Clarification is handled via a round counter (max 3 rounds) with **state validation** — only `NeedsClarification`-status goals accept clarification; status transitions are correctly `Understanding → Executing/NeedsClarification`.
+- Figure-of-speech detection uses a **heuristic scanner** (string patterns with `contains()`), not a model — fast, deterministic, suitable for a first pass.
+- UMI resolution prompt instructs the model to "minimise user clarification rounds while avoiding incorrect actions" — encourages decisive resolution when confident, explicit ambiguity flagging when not.
+- `format_ambiguity_context()` produces `[Resolved]` / `[Unresolved]` prefixed strings so downstream code can trivially filter by prefix.
 
 ---
 
-## Phase 10 — Decentralized Cognitive Grids
+## Phase 10 — Decentralized Cognitive Grids (Completed)
 
 ### Motivation
 
-Single-node agOS is limited by available compute. Decentralized Cognitive Grids enable **multi-node agent orchestration** — agents on one node can cIPC to agents on another node, migrate between nodes, and coordinate globally.
+Single-node agOS is limited by available compute. Decentralized Cognitive Grids enable **multi-node agent orchestration** — agents on one node can cIPC to agents on another node, migrate between nodes, and coordinate globally. No external dependencies (etcd/Consul) — nodes discover each other manually via REST and maintain heartbeats for liveness.
 
-### Design
+### What Was Built
 
-```
-  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-  │  agOS Node A │     │  agOS Node B │     │  agOS Node C │
-  │  :7400       │←───→│  :7400       │←───→│  :7400       │
-  └──────────────┘     └──────────────┘     └──────────────┘
-         │                                       │
-         │          Gossip Protocol               │
-         └────────────────────────────────────────┘
-                          │
-                    ┌─────┴─────┐
-                    │ Grid DNS  │  ← Service discovery, node registry
-                    │ (etcd)    │
-                    └───────────┘
-```
+- **`CognitiveGrid`** (`src/grid.rs`) — core grid state and operations:
+  - **Peer discovery** — `add_peer(node_id, address)` registers a peer; `list_peers()` returns all; `remove_peer()` drops a peer.
+  - **Heartbeat tracking** — `record_heartbeat(node_id)` timestamps receipt; `stale_peers(threshold_secs)` returns peers with no heartbeat within the window.
+  - **Agent migration** — `freeze_process(pid, context, agent_app)` serialises process state into a `MigratingProcess` payload; `receive_process(incoming)` deserialises and returns `CognitiveProcessContext` for the kernel to register.
+  - **PID resolution** — `resolve_pid(pid)` returns `ResolveResult::Local` or `ResolveResult::Remote(node_id)` based on peer-stored PID ownership.
+  - **Metrics** — `stats()` returns `GridStats { peer_count, message_count }`.
 
-### Implementation Steps
+- **Key types**:
+  ```rust
+  pub struct PeerInfo { pub node_id: String, pub address: String, pub status: PeerStatus, pub last_seen: String }
+  pub enum PeerStatus { Online, Stale, Offline }
+  pub struct MigratingProcess { pub pid, pub agent_app, pub state }
+  pub enum GridMessage { Join { node_id, address }, Heartbeat { node_id }, Migrate { pid, target_node }, ... }
+  pub struct GridStats { pub peer_count: usize, pub message_count: u64 }
+  ```
 
-1. **Grid Discovery**:
-   - Nodes register with a shared etcd/Consul cluster on startup.
-   - Each node maintains a `HashMap<NodeId, SocketAddr>` of peers.
-   - Heartbeat every 5s; nodes are evicted after 3 missed heartbeats.
+- **Kernel integration** (`kernel.rs`):
+  - `pub grid: CognitiveGrid` field (NOT feature-gated — always compiled)
+  - `agOSKernel::new(umi, listen_addr)` — constructor takes a listen address for the node ID
+  - `migrate_process(pid, target_node)` — freezes the process via `grid.freeze_process`, logs a `PROCESS_MIGRATED` episodic event, kills the local process
+  - `receive_process(incoming)` — calls `grid.receive_process`, registers the new PID on the scheduler, logs a `PROCESS_RECEIVED` episodic event
 
-2. **Remote cIPC**:
-   - Extend `CIPCBus::route()` to check if `to` PID is local or remote.
-   - For remote PIDs, forward the message via HTTP to the peer node's `/cipc/route` endpoint.
-   - Add a `node_id` field to `Message`.
+- **REST endpoints**:
+  | Endpoint | Method | Description |
+  |----------|--------|-------------|
+  | `/grid/join` | POST | Register peer node on the grid |
+  | `/grid/peers` | GET | List known peers |
+  | `/grid/stats` | GET | Grid statistics |
+  | `/grid/heartbeat` | POST | Record heartbeat from peer |
+  | `/grid/migrate` | POST | Migrate agent to another node |
+  | `/grid/receive` | POST | Accept migrated agent |
+  | `/grid/cipc/forward` | POST | Forward cIPC message from another node |
 
-3. **Agent Migration**:
-   - `POST /kernel/migrate { pid, target_node }` freezes the process state, serializes it, sends it to the target node's `POST /kernel/receive`, and unregisters locally.
-   - The target node deserializes and registers the process.
-
-4. **Global Episodic Ledger**:
-   - Episodic events carry a `node_id`.
-   - The ledger can be queried globally (`GET /grid/episodic?node=all`).
-   - Each node serves as a ledger replica via gossip.
-
-### Files to Modify
+### Key Files
 
 | File | Change |
 |------|--------|
-| `agos-kernel/src/grid.rs` | New file — discovery, gossip, remote routing |
-| `agos-kernel/src/lib.rs` | Add `pub mod grid` |
-| `agos-kernel/src/cipc.rs` | Remote routing logic |
-| `agos-kernel/src/kernel.rs` | `migrate_process()`, `receive_process()` |
-| `agos-kernel/src/api.rs` | `/grid/*`, `/kernel/migrate`, `/kernel/receive` |
-| `agos-demo/...` | Grid dashboard showing cluster health |
+| `agos-kernel/src/grid.rs` | New file — `CognitiveGrid`, `PeerInfo`, `PeerStatus`, `MigratingProcess`, `GridMessage`, `GridStats` |
+| `agos-kernel/src/lib.rs` | Added `pub mod grid` (no feature gate) |
+| `agos-kernel/src/kernel.rs` | Added `pub grid: CognitiveGrid`; constructor takes `listen_addr`; `migrate_process()`, `receive_process()` |
+| `agos-kernel/src/api.rs` | 7 `/grid/*` routes |
+| `agos-kernel/src/main.rs` | `agOSKernel::new(umi, "127.0.0.1:7400")` |
 
 ### Testing
 
-- Start 2 kernel instances on different ports (7400, 7401).
-- Spawn an agent on node A, cIPC to an agent on node B.
-- Migrate an agent from A to B, verify state is preserved.
-- Kill node A, verify heartbeat eviction within 15s.
+```bash
+# Grid unit tests (always run, no feature gate)
+cargo test -- grid
+# 9 tests: add/list/remove peers, heartbeat, stale detection, freeze/receive, PID resolution, stats
+
+# Full suite:
+cargo test --features "z3-solver,wasm-sandbox,embodiment"
+# 46 tests total (22 embodiment + 9 memory + 2 sandbox + 4 Z3 + 9 grid)
+```
+
+### Key Design Decisions
+
+- **No feature gate** — `CognitiveGrid` is always compiled (core subsystem), unlike Z3/WASM/Embodiment. This means grid endpoints are always available.
+- **P2P discovery** — no etcd/Consul dependency. Nodes add each other manually via `/grid/join`. Heartbeats are passive (recorded on receipt). A background daemon for liveness checks can be added later.
+- **`receive_process()` returns `CognitiveProcessContext`** without registering — the kernel wrapper `agOSKernel::receive_process()` handles registration and episodic logging, keeping the grid module agnostic to kernel internals.
+- **`resolve_pid()`** returns an enum (`Local` vs `Remote(node_id)`), allowing future cIPC route extension to forward messages to remote nodes via `/grid/cipc/forward`.
 
 ### Open Questions
 
@@ -1036,12 +1055,12 @@ steps:
 | Structured Audit Export | 2 days | Medium — compliance use cases | Persistent Storage | 6 |
 | **Phase 6**: Episodic Compression Daemon | 3 days | Medium — memory management | None | 7 |
 | Sub-Agent Orchestration DSL | 5 days | High — agent composability | None | 8 |
-| **Phase 7**: Z3 SMT Solver | 5 days | Medium — formal verification | None | 9 |
+| **Phase 7**: Z3 SMT Solver | 5 days | Medium — formal verification | None | ✓ Complete |
 | OpenTelemetry Instrumentation | 2 days | Low — observability | None | 10 |
-| **Phase 8**: WebAssembly Sandbox | 2 weeks | High — secure tool execution | wasmtime | 11 |
+| **Phase 8**: WebAssembly Sandbox | 2 weeks | High — secure tool execution | wasmtime | ✓ Complete |
 | Kubernetes Operator | 3 days | Medium — cloud deployment | Dockerfile | 12 |
-| **Phase 9**: Embodiment Layer | 3 weeks | High — robotics use cases | UMI, WASM sandbox | 13 |
-| **Phase 10**: Decentralized Grids | 4 weeks | High — scale-out architecture | Persistent Storage | 14 |
+| **Phase 9**: Embodiment Layer | 3 weeks | High — robotics use cases | UMI, WASM sandbox | ✓ Complete |
+| **Phase 10**: Decentralized Grids | 4 weeks | High — scale-out architecture | Persistent Storage | ✓ Complete |
 
 ---
 
