@@ -1,0 +1,9 @@
+{
+  "name": "Financial Auditor",
+  "version": "1.0.0",
+  "description": "Multi-agent financial validation and auditing suite",
+  "permissions": ["financial:read", "financial:validate", "cipc:communicate", "memory:page"],
+  "limits": { "max_tokens": 5000, "max_subagents": 3 },
+  "priority": 2,
+  "goal_metric": 0.95
+}

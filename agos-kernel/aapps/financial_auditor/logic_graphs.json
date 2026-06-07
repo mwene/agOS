@@ -1,0 +1,10 @@
+{
+  "initial_state": "validate_balance",
+  "states": {
+    "validate_balance": { "transitions": { "balance_ok": "verify_transactions", "balance_error": "flag_anomaly" } },
+    "verify_transactions": { "transitions": { "all_verified": "generate_report", "suspicious": "flag_anomaly" } },
+    "flag_anomaly": { "transitions": { "resolved": "verify_transactions", "escalated": "escalate_to_auditor" } },
+    "escalate_to_auditor": { "transitions": { "audited": "generate_report" } },
+    "generate_report": { "transitions": { "complete": "__terminal__" } }
+  }
+}

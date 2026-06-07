@@ -1,0 +1,1 @@
+{"name": "compute_tax_liability", "description": "Compute tax liability from ledger", "input_schema": {"type": "object", "required": ["income", "deductions"]}}

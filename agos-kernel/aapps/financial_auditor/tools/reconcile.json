@@ -1,0 +1,5 @@
+{
+  "name": "reconcile_accounts",
+  "description": "Reconcile two financial ledgers and return discrepancies",
+  "input_schema": { "type": "object", "required": ["ledger_a", "ledger_b"], "properties": { "ledger_a": {"type": "array", "items": {"type": "number"}}, "ledger_b": {"type": "array", "items": {"type": "number"}} } }
+}

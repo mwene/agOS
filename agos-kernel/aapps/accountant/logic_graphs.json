@@ -1,0 +1,7 @@
+{
+  "initial_state": "compute_tax",
+  "states": {
+    "compute_tax": { "transitions": { "done": "file_return" } },
+    "file_return": { "transitions": { "filed": "__terminal__" } }
+  }
+}

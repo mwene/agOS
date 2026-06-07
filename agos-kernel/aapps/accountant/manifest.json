@@ -1,0 +1,9 @@
+{
+  "name": "Accountant",
+  "version": "1.0.0",
+  "description": "Tax computation and ledger reconciliation agent",
+  "permissions": ["financial:read", "financial:compute", "cipc:communicate", "memory:page"],
+  "limits": { "max_tokens": 3000, "max_subagents": 2 },
+  "priority": 1,
+  "goal_metric": 0.97
+}

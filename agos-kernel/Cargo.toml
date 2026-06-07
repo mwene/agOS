@@ -1,0 +1,20 @@
+[package]
+name = "agos-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "agOS (Agentic Operating System) – Cognitive Kernel"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+dashmap = "6"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+tower = "0.5"
+async-trait = "0.1"
