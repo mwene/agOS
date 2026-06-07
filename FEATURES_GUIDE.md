@@ -11,7 +11,7 @@ This guide documents all 10 phases of the agOS development roadmap — **Phases 
 - [Phase 3 — Hierarchical Cognitive Memory + cIPC Bus](#phase-3--hierarchical-cognitive-memory--cipc-bus)
 - [Phase 4 — Ring 0 Neuro-Symbolic Guard Layer](#phase-4--ring-0-neuro-symbolic-guard-layer)
 - [Phase 5 — Sandbox Installer + Integration Smoke Test](#phase-5--sandbox-installer--integration-smoke-test)
-- [Phase 6 — Episodic Compression Daemon](#phase-6--episodic-compression-daemon)
+- [Phase 6 — Episodic Compression Daemon (Completed)](#phase-6--episodic-compression-daemon)
 - [Phase 7 — Native Z3 SMT Solver (Completed)](#phase-7--native-z3-smt-solver)
 - [Phase 8 — WebAssembly Sandbox (Completed)](#phase-8--webassembly-sandbox)
 - [Phase 9 — Embodiment Layer (VLA Driver Pipeline) (Completed)](#phase-9--embodiment-layer-vla-driver-pipeline)
@@ -308,19 +308,21 @@ cd agos-demo && mvn spring-boot:run
 
 ---
 
-## Phase 6 — Episodic Compression Daemon
+## Phase 6 — Episodic Compression Daemon (Completed)
 
 ### Motivation
 
 The episodic ledger is an in-memory `Vec<EpisodicEntry>` that grows unboundedly with every system event (spawn, kill, cIPC, panic, etc.). Without a background eviction and compression strategy, the kernel will exhaust memory under sustained load.
 
-### Design
+### What Was Built
 
-A background tokio task runs on a configurable interval and performs:
+A background tokio task runs on a configurable interval and performs age-based compression:
 
-1. **Age-based tiering**: entries older than a threshold are candidates for compression.
-2. **Semantic compression**: groups entries by `pid + event_type`, summarizes them into a single L2 entry.
-3. **Episodic pruning**: raw entries are evicted from the ledger after compression.
+- **`EpisodicConfig`** (`src/memory.rs`) — config struct with `compression_interval_secs` (default: 60), `max_entries_before_compress` (default: 100), and `entry_ttl_secs` (default: 300).
+- **`compress_episodic()`** on `HierarchicalMemoryManager` — partitions the ledger into fresh vs stale entries by timestamp, prunes stale entries, writes summaries to L2.
+- **Background daemon** (`src/main.rs`) — `tokio::spawn` loop that calls `compress_episodic()` on the configured interval with `MissedTickBehavior::Skip`.
+- **Manual trigger** via `POST /memory/episodic/compress` REST endpoint.
+- **`compressed_entries`** counter added to `MemoryStats`.
 
 ```
                     ┌──────────────────┐
@@ -343,63 +345,23 @@ A background tokio task runs on a configurable interval and performs:
               └──────────┘     └──────────────┘
 ```
 
-### Implementation Steps
-
-1. **Add config to `agOSKernel`**:
-   ```rust
-   pub struct EpisodicConfig {
-       pub compression_interval_secs: u64,
-       pub max_entries_before_compress: usize,
-       pub entry_ttl_secs: u64,
-   }
-   ```
-
-2. **Add a background task in `main.rs`**:
-   ```rust
-   let kernel_clone = kernel.clone();
-   tokio::spawn(async move {
-       let mut interval = tokio::time::interval(Duration::from_secs(60));
-       loop {
-           interval.tick().await;
-           kernel_clone.memory.compress_episodic().await;
-       }
-   });
-   ```
-
-3. **Add `compress_episodic()` to `HierarchicalMemoryManager`**:
-   ```rust
-   pub async fn compress_episodic(&self) -> usize {
-       let mut ledger = self.episodic_ledger.write().unwrap();
-       let cutoff = Utc::now() - chrono::Duration::seconds(entry_ttl_secs as i64);
-       let (fresh, stale) = ledger.iter().cloned()
-           .partition(|e| e.timestamp > cutoff.to_rfc3339());
-       // Group stale by (pid, event_type), write summaries to L2
-       *ledger = fresh;
-       stale.len()
-   }
-   ```
-
-4. **Expose stats**: add `compressed_entries` to `MemoryStats`.
-5. **Add REST endpoint**: `POST /memory/episodic/compress` for manual trigger.
-
-### Files to Modify
+### Key Files
 
 | File | Change |
 |------|--------|
-| `agos-kernel/src/memory.rs` | Add `compress_episodic()`, config struct, stats field |
-| `agos-kernel/src/kernel.rs` | Add `EpisodicConfig` to `agOSKernel` |
-| `agos-kernel/src/main.rs` | `tokio::spawn` the background daemon |
-| `agos-kernel/src/api.rs` | Add `POST /memory/episodic/compress` route |
+| `agos-kernel/src/memory.rs` | `EpisodicConfig`, `compress_episodic()`, `compressed_entries` stats field |
+| `agos-kernel/src/main.rs` | Background `tokio::spawn` daemon |
+| `agos-kernel/src/api.rs` | `POST /memory/episodic/compress` route |
 
 ### Testing
 
-- Unit: seed 100+ entries, run compression, verify count dropped.
-- Integration: start kernel, generate events, call manual compress endpoint, verify stats.
-
-### Open Questions
-
-- Should compression be configurable per-process?
-- What summary format for L2? JSON blob, text summary via UMI SYS_COMPRESS, or both?
+```bash
+cargo test -- memory
+# 9 tests including:
+# - test_compress_episodic_no_stale — TTL=0 prunes everything
+# - test_compress_episodic_with_stale — TTL=3600 keeps fresh entries
+# - test_compress_episodic_partial — verifies progressive compression
+```
 
 ---
 
@@ -867,62 +829,60 @@ d.total_tokens.fetch_add(total, Ordering::Relaxed);
 
 ---
 
-### OpenTelemetry Instrumentation
+### OpenTelemetry Instrumentation (Completed)
 
 **Motivation**: Trace requests across the kernel for debugging and performance analysis.
 
-**Implementation**:
+**What Was Built**:
 
-1. Add `opentelemetry`, `opentelemetry-otlp` dependencies.
-2. Create `src/telemetry.rs`:
-   ```rust
-   use opentelemetry::*;
+- **`telemetry.rs`** (`src/telemetry.rs`) — initialises an OTLP tracer via `opentelemetry_otlp`, sets the global text map propagator, and returns a `tracing_opentelemetry` layer that layers on top of the `tracing-subscriber` registry.
+- **`init_telemetry()`** — called from `main.rs` right after `tracing-subscriber` init; registers the OTLP exporter and an optional `ShutdownGuard` that flushes spans on drop.
+- **`#[instrument]`** annotations added to all `api.rs` handler functions, UMI syscall wrappers, and kernel orchestration methods (`spawn_process`, `kill_process`, `kernel_panic`, `sandbox_install`, `sandbox_launch`, `migrate_process`, `receive_process`).
+- **Graceful shutdown** — the `shutdown_guard` flushes pending spans when the kernel receives SIGTERM or SIGINT.
+- Configuration via environment variables: `OTLP_ENDPOINT` (defaults to `http://localhost:4317`), `AGOS_SERVICE_NAME` (defaults to `agos-kernel`).
 
-   pub fn init_tracer() -> Result<(), opentelemetry::errors::OpenTelemetryError> {
-       global::set_text_map_propagator(opentelemetry_otlp::Propagator::new());
-       let tracer = opentelemetry_otlp::new_pipeline()
-           .install_simple()?;
-       // Use with tracing: tracing_opentelemetry::layer()
-       Ok(())
-   }
-   ```
+**Key Files**:
 
-3. Add `#[instrument]` to each `api.rs` handler.
-4. Export to Jaeger or Grafana Tempo.
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/telemetry.rs` | Tracer init, `#[instrument]` macro usage, shutdown guard |
+| `agos-kernel/Cargo.toml` | Added `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry` |
+| `agos-kernel/src/main.rs` | `init_telemetry()` call in boot sequence |
 
-**Files**: `agos-kernel/src/telemetry.rs`, `agos-kernel/Cargo.toml`, `agos-kernel/src/main.rs`.
+**Configuration**:
+
+```bash
+AGOS_SERVICE_NAME=agos-kernel OTLP_ENDPOINT=http://jaeger:4317 cargo run
+```
 
 ---
 
-### Kubernetes Operator
+### Kubernetes Operator (Completed)
 
 **Motivation**: Deploy agOS as a cloud-native service on Kubernetes.
 
-**Implementation**:
+**What Was Built**:
 
-1. `Dockerfile`:
-   ```dockerfile
-   FROM rust:1.75 AS build
-   WORKDIR /app
-   COPY . .
-   RUN cargo build --release
+- **`deploy/k8s/deployment.yaml`** — Kubernetes Deployment with 1 replica (configurable), liveness/readiness probes on `/health`, resource requests/limits, environment variables from ConfigMap.
+- **`deploy/k8s/service.yaml`** — ClusterIP service on port 7400, with annotations for Prometheus scraping.
+- **`deploy/k8s/configmap.yaml`** — `RUST_LOG=info` and `AGOS_SERVICE_NAME=agos-kernel`.
+- **`deploy/k8s/hpa.yaml`** — Horizontal Pod Autoscaler targeting 50% CPU / 70% memory utilization, min 1 / max 10 replicas.
+- All manifests include `apiVersion`, `kind`, `metadata.labels`, and `spec.template.metadata.labels` consistent with Kubernetes best practices.
 
-   FROM debian:bookworm-slim
-   COPY --from=build /app/target/release/agos-kernel /usr/local/bin/
-   COPY --from=build /app/aapps /aapps
-   EXPOSE 7400
-   CMD ["agos-kernel"]
-   ```
+**Key Files**:
 
-2. `deploy/k8s/`:
-   - `deployment.yaml` — kernel pod, liveness/readiness probes on `/health`.
-   - `service.yaml` — ClusterIP for internal, NodePort/LoadBalancer for external.
-   - `configmap.yaml` — `RUST_LOG=info`, `--db-path` flag.
-   - `hpa.yaml` — Horizontal Pod Autoscaler based on memory/cpu.
+| File | Purpose |
+|------|---------|
+| `deploy/k8s/deployment.yaml` | Kernel pod spec with probes and resource limits |
+| `deploy/k8s/service.yaml` | ClusterIP service definition |
+| `deploy/k8s/configmap.yaml` | Environment configuration |
+| `deploy/k8s/hpa.yaml` | Autoscaling policy |
 
-3. (Optional) `deploy/k8s/operator/` — a Rust or Go operator that manages `.aapp` deployments as custom resources.
+**Deploy**:
 
-**Files**: New `deploy/` directory.
+```bash
+kubectl apply -f deploy/k8s/
+```
 
 ---
 
@@ -954,111 +914,146 @@ d.total_tokens.fetch_add(total, Ordering::Relaxed);
 
 ---
 
-### Sub-Agent Orchestration DSL
+### Sub-Agent Orchestration DSL (Completed)
 
 **Motivation**: The current `logic_graphs.json` state machine is limited to flat transitions. A DSL would allow hierarchical sub-agent orchestration with parallel execution, joins, and timeouts.
 
-**Design** (YAML):
+**What Was Built**:
 
-```yaml
-workflow: financial_audit
-steps:
-  - id: validate_balance
-    agent: BalanceChecker
-    timeout: 30s
-    on_success: verify_transactions
-    on_failure: flag_anomaly
+- **`orchestrator.rs`** (`src/orchestrator.rs`) — `SubAgentOrchestrator` struct that manages a map of workflow instances (`HashMap<String, WorkflowInstance>`). Each instance tracks the `WorkflowDefinition` (parsed DSL), its current step, per-step status (`Pending`, `Running`, `Succeeded`, `Failed`, `TimedOut`), child PIDs, and timestamps.
+- **DSL parsing** — the `WorkflowDefinition` YAML/JSON format is parsed in `sandbox.rs` as part of `AAppLoader`. A new optional field `workflow` is extracted from the `.aapp` directory alongside `logic_graphs.json`. The DSL supports:
+  - Sequential steps with `on_success` / `on_failure` transitions
+  - Parallel branches (`parallel: [{agent: X}, {agent: Y}]`) with `join: all` or `join: any`
+  - Timeouts per step (`timeout: 30s`)
+  - `__terminal__` sentinel for workflow completion
+- **Sandbox integration** — `InstallResult` now includes a `has_workflow: bool` field; the sandbox loader checks for a `workflow` key in `manifest.json` and stores it during install.
+- **REST endpoints**:
+  - `POST /workflow/run {name, aapps_path}` — loads the `.aapp`, parses its workflow DSL, creates a `WorkflowInstance`, spawns the first step as a sub-agent, and returns the workflow ID.
+  - `GET /workflow/status/:id` — returns the current step, overall status, child PIDs, and step-level details.
+- **Kernel wiring** — `agOSKernel` holds a `pub orchestrator: SubAgentOrchestrator` field; the workflow endpoints delegate to orchestrator methods which call `spawn_process` for each step.
+- A workflow step's agent is expected to be another `.aapp` package name; the orchestrator calls `sandbox_install` + `sandbox_launch` under the hood.
 
-  - id: verify_transactions
-    agent: TransactionVerifier
-    parallel:
-      - agent: FraudDetector
-      - agent: ComplianceChecker
-    join: all
-    on_success: generate_report
+**Key Files**:
 
-  - id: generate_report
-    agent: ReportGenerator
-    on_success: __terminal__
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/orchestrator.rs` | `SubAgentOrchestrator`, `WorkflowDefinition`, `WorkflowInstance`, DSL types |
+| `agos-kernel/src/sandbox.rs` | Workflow DSL extraction in `AAppLoader`, `has_workflow` field |
+| `agos-kernel/src/kernel.rs` | `pub orchestrator` field |
+| `agos-kernel/src/api.rs` | `POST /workflow/run`, `GET /workflow/status/:id` routes |
+| `agos-kernel/src/lib.rs` | `pub mod orchestrator` |
+
+**Example DSL** (in `manifest.json`):
+
+```json
+{
+  "name": "Financial Audit",
+  "workflow": {
+    "steps": [
+      {"id": "validate_balance", "agent": "BalanceChecker", "timeout": 30, "on_success": "verify_transactions", "on_failure": "flag_anomaly"},
+      {"id": "verify_transactions", "agent": "TransactionVerifier", "on_success": "generate_report"},
+      {"id": "generate_report", "agent": "ReportGenerator", "on_success": "__terminal__"}
+    ]
+  }
+}
 ```
-
-**Implementation**:
-
-1. Parse DSL in `AAppLoader` alongside `logic_graphs.json`.
-2. `SubAgentOrchestrator` struct in `kernel.rs` manages the DAG execution.
-3. Each step spawns a sub-agent process (child PID).
-4. Parallel steps spawn multiple children and wait for all to complete (join) or any to complete (race).
-
-**Files**: `agos-kernel/src/orchestrator.rs`, DSL parsing in `sandbox.rs`.
 
 ---
 
-### Structured Audit Export
+### Structured Audit Export (Completed)
 
 **Motivation**: The audit log is in-memory JSON. Compliance use cases require export to S3, Splunk, or SIEM systems.
 
-**Implementation**:
+**What Was Built**:
 
-1. Add `POST /security/audit/export` with parameters:
-   ```json
-   { "format": "jsonl" | "csv", "since": "2026-01-01T00:00:00Z", "sink": "stdout" | "s3" }
-   ```
+- **`audit_export.rs`** (`src/audit_export.rs`) — defines the `AuditExporter` async trait and three implementations:
+  - `StdoutExporter` — formats entries as JSONL and prints to stdout.
+  - `JsonlFileExporter` — writes JSONL to a local file path.
+  - `S3Exporter` — formats entries as JSONL and writes to an S3-compatible object store (uses `rusty_s3` for S3 REST API calls).
+- **`format_entries(entries, format)`** — supports `"jsonl"` (NDJSON stream of audit objects) and `"csv"` (comma-separated with header row: `timestamp,action,result,reason`).
+- **REST endpoint**: `POST /security/audit/export` with request body:
+  ```json
+  {"format": "jsonl", "since": "2026-06-01T00:00:00Z", "sink": {"type": "s3", "bucket": "agos-audit", "key": "audit/export.jsonl"}}
+  ```
+  Supported sink types: `"stdout"`, `"jsonl_file"`, `"s3"`.
+- **Since filter** — optional ISO 8601 timestamp; only entries after this time are included.
+- The endpoint filters in-memory audit entries by `since`, formats them via `format_entries`, then delegates to the selected exporter.
 
-2. Implement `AuditExporter` trait:
-   ```rust
-   #[async_trait]
-   pub trait AuditExporter {
-       async fn export(&self, entries: &[AuditEntry]) -> Result<(), String>;
-   }
-   ```
+**Key Files**:
 
-3. Implementations: `StdoutExporter`, `S3Exporter` (using `aws-sdk-s3`), `SplunkExporter` (HTTP Event Collector).
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/audit_export.rs` | `AuditExporter` trait, `StdoutExporter`, `JsonlFileExporter`, `S3Exporter`, `format_entries()` |
+| `agos-kernel/src/api.rs` | `POST /security/audit/export` route |
+| `agos-kernel/src/lib.rs` | `pub mod audit_export` |
 
-**Files**: `agos-kernel/src/audit_export.rs`, `agos-kernel/src/api.rs`.
+**Testing**:
+
+```bash
+curl -X POST http://127.0.0.1:7400/security/audit/export \
+  -H 'Content-Type: application/json' \
+  -d '{"format": "jsonl", "since": "2026-06-01T00:00:00Z", "sink": {"type": "stdout"}}'
+```
 
 ---
 
-### Secure .aapp Signing
+### Secure .aapp Signing (Completed)
 
 **Motivation**: Ensure `.aapp` packages haven't been tampered with since authoring.
 
-**Design**:
+**What Was Built**:
 
+- **`agos-sign/`** — a standalone Rust CLI tool with three subcommands:
+  - `gen-key` — generates an ED25519 keypair, writes private key to `private.pem` and public key to `public.pem` (both PEM-encoded).
+  - `sign <aapp-dir>` — walks the `.aapp` directory (all files except `signature.sig`), concatenates them deterministically, SHA-256 hashes, signs with ED25519, writes `signature.sig` as raw bytes.
+  - `verify <aapp-dir> <public-key-file>` — re-hashes all files, verifies `signature.sig` against the public key.
+- **Sandbox verification** — in `sandbox.rs`, during `install`:
+  - Checks for `signature.sig` in the `.aapp` directory.
+  - If present, hashes the package files and verifies the signature against the public key loaded from the `AGOS_TRUSTED_KEY` environment variable (or skips verification if unset — backward compatible).
+  - Rejects install with `"signature verification failed"` if the signature is invalid.
+  - Adds `signature_valid: bool` to `InstallResult`.
+- **No external dependencies** — uses `ed25519-dalek` (2.x) and `sha2` for the cryptographic operations.
+
+**Key Files**:
+
+| File | Purpose |
+|------|---------|
+| `agos-sign/src/main.rs` | CLI tool: `gen-key`, `sign`, `verify` subcommands |
+| `agos-sign/Cargo.toml` | `ed25519-dalek`, `sha2`, `clap`, `base64` |
+| `agos-kernel/src/sandbox.rs` | Signature verification in `AAppLoader`, `signature_valid` field |
+| `agos-kernel/Cargo.toml` | `ed25519-dalek`, `sha2` dependencies |
+
+**Usage**:
+
+```bash
+# Generate a keypair
+cargo run -p agos-sign -- gen-key
+
+# Sign a .aapp package
+cargo run -p agos-sign -- sign aapps/financial_auditor
+
+# Run kernel with trusted key
+AGOS_TRUSTED_KEY=$(cat public.pem) cargo run -p agos-kernel
 ```
-.aapp directory:
-├── manifest.json
-├── logic_graphs.json
-├── tools/
-├── validation_tests/
-└── signature.sig      ← ED25519 signature of all other files
-```
-
-**Implementation**:
-
-1. On install, the kernel checks `signature.sig` against a trusted public key (`--trusted-key` flag).
-2. Signing tool: `agos-sign` CLI that walks a `.aapp` directory, hashes all files, signs with a private key.
-3. Rejection: if signature is missing or invalid, the install fails with `"signature verification failed"`.
-
-**Files**: New CLI tool `agos-sign/`, verification logic in `sandbox.rs`.
 
 ---
 
 ## Feature Prioritization
 
-| Feature | Effort | Impact | Dependencies | Recommended Order |
-|---------|--------|--------|-------------|-------------------|
-| Persistent Storage (SQLite) | 2 days | High — data survives restart | None | 1 |
-| Token Accounting with Real Models | 1 day | High — accurate budgeting | UMI drivers (existing) | 2 |
-| Rate Limiting and QoS | 1 day | Medium — production hardening | None | 3 |
-| Pluggable Scheduler Policies | 3 days | Medium — scheduling flexibility | None | 4 |
-| Secure .aapp Signing | 2 days | Medium — supply chain security | None | 5 |
-| Structured Audit Export | 2 days | Medium — compliance use cases | Persistent Storage | 6 |
-| **Phase 6**: Episodic Compression Daemon | 3 days | Medium — memory management | None | 7 |
-| Sub-Agent Orchestration DSL | 5 days | High — agent composability | None | 8 |
+| Feature | Effort | Impact | Dependencies | Status |
+|---------|--------|--------|-------------|--------|
+| Persistent Storage (SQLite) | 2 days | High — data survives restart | None | Planned |
+| Token Accounting with Real Models | 1 day | High — accurate budgeting | UMI drivers (existing) | Planned |
+| Rate Limiting and QoS | 1 day | Medium — production hardening | None | Planned |
+| Pluggable Scheduler Policies | 3 days | Medium — scheduling flexibility | None | Planned |
+| Secure .aapp Signing | 2 days | Medium — supply chain security | None | ✓ Implemented |
+| Structured Audit Export | 2 days | Medium — compliance use cases | None | ✓ Implemented |
+| **Phase 6**: Episodic Compression Daemon | ✓ | — | — | ✓ Complete |
+| Sub-Agent Orchestration DSL | 5 days | High — agent composability | None | ✓ Implemented |
 | **Phase 7**: Z3 SMT Solver | 5 days | Medium — formal verification | None | ✓ Complete |
-| OpenTelemetry Instrumentation | 2 days | Low — observability | None | 10 |
+| OpenTelemetry Instrumentation | 2 days | Medium — observability | None | ✓ Implemented |
 | **Phase 8**: WebAssembly Sandbox | 2 weeks | High — secure tool execution | wasmtime | ✓ Complete |
-| Kubernetes Operator | 3 days | Medium — cloud deployment | Dockerfile | 12 |
+| Kubernetes Operator | 3 days | Medium — cloud deployment | Dockerfile | ✓ Implemented |
 | **Phase 9**: Embodiment Layer | 3 weeks | High — robotics use cases | UMI, WASM sandbox | ✓ Complete |
 | **Phase 10**: Decentralized Grids | 4 weeks | High — scale-out architecture | Persistent Storage | ✓ Complete |
 

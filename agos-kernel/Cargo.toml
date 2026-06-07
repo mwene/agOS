@@ -7,7 +7,7 @@ description = "agOS (Agentic Operating System) – Cognitive Kernel"
 [features]
 default = []
 z3-solver = ["dep:z3"]
-wasm-sandbox = ["dep:wasmtime", "dep:base64"]
+wasm-sandbox = ["dep:wasmtime"]
 embodiment = []
 
 [dependencies]
@@ -26,7 +26,14 @@ tower = "0.5"
 async-trait = "0.1"
 z3 = { version = "0.7", optional = true }
 wasmtime = { version = "45", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+opentelemetry = { version = "0.22", features = ["trace"] }
+opentelemetry-otlp = { version = "0.15", features = ["trace"] }
+opentelemetry_sdk = { version = "0.22", features = ["trace", "rt-tokio"] }
+tracing-opentelemetry = "0.23"
+ed25519-dalek = { version = "2", features = ["serde"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 wat = "1"

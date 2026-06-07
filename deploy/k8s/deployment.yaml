@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agos-kernel
+  labels:
+    app: agos-kernel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agos-kernel
+  template:
+    metadata:
+      labels:
+        app: agos-kernel
+    spec:
+      containers:
+        - name: kernel
+          image: agos-kernel:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--features"
+            - "z3-solver,wasm-sandbox,embodiment"
+            - "--db-path"
+            - "/data/kernel.db"
+          ports:
+            - containerPort: 7400
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: agos-kernel-config
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7400
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 7400
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+            - name: aapps
+              mountPath: /aapps
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: agos-kernel-config
+        - name: aapps
+          configMap:
+            name: agos-aapps

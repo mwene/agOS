@@ -2,6 +2,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::storage::SharedStore;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub action: Value,
@@ -115,6 +117,7 @@ fn evaluate_constraint(c: &Constraint, claim: &Value) -> bool {
 pub struct SecurityEngine {
     smt_solver: SMTSolver,
     audit_log: std::sync::RwLock<Vec<AuditEntry>>,
+    store: SharedStore,
     #[cfg(feature = "z3-solver")]
     z3_solver: crate::z3_solver::Z3PolicySolver,
 }
@@ -131,11 +134,16 @@ impl SecurityEngine {
         let mut engine = SecurityEngine {
             smt_solver: SMTSolver::new(),
             audit_log: std::sync::RwLock::new(Vec::new()),
+            store: None,
             #[cfg(feature = "z3-solver")]
             z3_solver: crate::z3_solver::Z3PolicySolver::new(),
         };
         engine.init_default_policies();
         engine
+    }
+
+    pub fn set_store(&mut self, store: SharedStore) {
+        self.store = store;
     }
 
     fn init_default_policies(&self) {
@@ -157,6 +165,21 @@ impl SecurityEngine {
             value: serde_json::json!(0),
             rule: "no_financial_transfer".to_string(),
         });
+    }
+
+    fn push_audit(&self, action_vector: &Value, result: &str, reason: &str) {
+        let entry = AuditEntry {
+            action: action_vector.clone(),
+            result: result.to_string(),
+            reason: reason.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+        };
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.append_audit(&entry) {
+                tracing::warn!("Failed to persist audit entry: {}", e);
+            }
+        }
+        self.audit_log.write().unwrap().push(entry);
     }
 
     pub fn ring0_verify(
@@ -189,12 +212,7 @@ impl SecurityEngine {
         });
 
         if let Err(msg) = self.smt_solver.check(&claim) {
-            self.audit_log.write().unwrap().push(AuditEntry {
-                action: action_vector.clone(),
-                result: "DENIED".to_string(),
-                reason: msg.clone(),
-                timestamp: Utc::now().to_rfc3339(),
-            });
+            self.push_audit(action_vector, "DENIED", &msg);
             return Err(msg);
         }
 
@@ -208,12 +226,7 @@ impl SecurityEngine {
                 amount,
                 &constraints,
             ) {
-                self.audit_log.write().unwrap().push(AuditEntry {
-                    action: action_vector.clone(),
-                    result: "DENIED".to_string(),
-                    reason: msg.clone(),
-                    timestamp: Utc::now().to_rfc3339(),
-                });
+                self.push_audit(action_vector, "DENIED", &msg);
                 return Err(msg);
             }
         }
@@ -221,22 +234,12 @@ impl SecurityEngine {
         if !permissions.is_empty() {
             let allowed = permissions.iter().any(|perm| match_permission(action_str, perm));
             if !allowed {
-                self.audit_log.write().unwrap().push(AuditEntry {
-                    action: action_vector.clone(),
-                    result: "DENIED".to_string(),
-                    reason: "Missing required permission for this action".to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                });
+                self.push_audit(action_vector, "DENIED", "Missing required permission for this action");
                 return Err("Missing required permission for this action".to_string());
             }
         }
 
-        self.audit_log.write().unwrap().push(AuditEntry {
-            action: action_vector.clone(),
-            result: "ALLOWED".to_string(),
-            reason: "verified".to_string(),
-            timestamp: Utc::now().to_rfc3339(),
-        });
+        self.push_audit(action_vector, "ALLOWED", "verified");
         Ok(())
     }
 

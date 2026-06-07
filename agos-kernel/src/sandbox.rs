@@ -1,6 +1,10 @@
+use base64::Engine;
+use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+use crate::orchestrator::WorkflowDefinition;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AAppPackage {
@@ -9,6 +13,8 @@ pub struct AAppPackage {
     pub logic_graphs: Value,
     pub tools: HashMap<String, Value>,
     pub validation_tests: Vec<Value>,
+    pub workflow: Option<WorkflowDefinition>,
+    pub signature_valid: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +25,8 @@ pub struct InstallResult {
     pub permissions: Vec<String>,
     pub token_quota: u64,
     pub states: usize,
+    pub signature_valid: Option<bool>,
+    pub has_workflow: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,12 +95,73 @@ impl AAppLoader {
             .unwrap_or("unknown")
             .to_string();
 
+        let workflow = if logic_path.exists() {
+            std::fs::read_to_string(&logic_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                .and_then(|val| crate::orchestrator::parse_dsl_from_value(&val))
+        } else {
+            None
+        };
+
+        let signature_valid = verify_aapp_signature(path);
+
         Ok(AAppPackage {
             name,
             manifest,
             logic_graphs,
             tools,
             validation_tests,
+            workflow,
+            signature_valid,
         })
     }
+}
+
+fn verify_aapp_signature(path: &std::path::Path) -> Option<bool> {
+    let sig_path = path.join("signature.sig");
+    if !sig_path.exists() {
+        return None;
+    }
+
+    let trusted_key = std::env::var("AGOS_TRUSTED_KEY").ok()?;
+    let sig_data = std::fs::read_to_string(&sig_path).ok()?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_data.trim())
+        .ok()?;
+    let sig_array: [u8; 64] = sig_bytes.try_into().ok()?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+
+    let pub_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(trusted_key.trim())
+        .ok()?;
+    let pub_key_array: [u8; 32] = pub_key_bytes.try_into().ok()?;
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_key_array).ok()?;
+
+    let hash = hash_aapp_dir(path);
+
+    Some(verifying_key.verify(&hash, &signature).is_ok())
+}
+
+fn hash_aapp_dir(aapp_dir: &std::path::Path) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut entries: Vec<_> = std::fs::read_dir(aapp_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            name_str != "signature.sig" && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in &entries {
+        if let Ok(data) = std::fs::read(entry.path()) {
+            hasher.update(&data);
+        }
+    }
+    hasher.finalize().to_vec()
 }

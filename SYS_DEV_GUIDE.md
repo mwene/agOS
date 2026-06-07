@@ -16,12 +16,15 @@ This guide covers the internal architecture, module interfaces, concurrency mode
   - [cipc.rs — CIPCBus](#cipcrs--cipcbus)
   - [security.rs — SecurityEngine + SMTSolver](#securityrs--securityengine--smtsolver)
   - [umi.rs — UnifiedModelInterface](#umirs--unifiedmodelinterface)
-   - [sandbox.rs — AAppLoader](#sandboxrs--aapploader)
-   - [z3_solver.rs — Z3PolicySolver](#z3_solversr--z3policysolver)
-   - [sandbox_wasm.rs — WasmSandbox](#sandbox_wasmrs--wasmsandbox)
-   - [embodiment.rs — EmbodimentLayer](#embodimentrs--embodimentlayer)
-   - [grid.rs — CognitiveGrid](#gridrs--cognitifrid)
-   - [api.rs — REST Router](#apirs--rest-router)
+  - [sandbox.rs — AAppLoader](#sandboxrs--aapploader)
+  - [z3_solver.rs — Z3PolicySolver](#z3_solversr--z3policysolver)
+  - [sandbox_wasm.rs — WasmSandbox](#sandbox_wasmrs--wasmsandbox)
+  - [embodiment.rs — EmbodimentLayer](#embodimentrs--embodimentlayer)
+  - [grid.rs — CognitiveGrid](#gridrs--cognitifrid)
+  - [orchestrator.rs — SubAgentOrchestrator](#orchestratorrs--subagentorchestrator)
+  - [audit_export.rs — AuditExporter](#audit_exportrs--auditexporter)
+  - [telemetry.rs — OpenTelemetry Init](#telemetryrs--opentelemetry-init)
+  - [api.rs — REST Router](#apirs--rest-router)
 - [Concurrency Model](#concurrency-model)
 - [Adding a New Kernel Subsystem](#adding-a-new-kernel-subsystem)
 - [Adding a New REST Endpoint](#adding-a-new-rest-endpoint)
@@ -38,26 +41,33 @@ This guide covers the internal architecture, module interfaces, concurrency mode
 ```
   main.rs
     │
+    ├── init_telemetry (telemetry.rs)
+    │     └── OTLP tracer layer
+    │
     ├── agOSKernel (kernel.rs)
-    │     ├── scheduler.rs  ────── TokenScheduler
-    │     ├── memory.rs     ────── HierarchicalMemoryManager
-    │     ├── cipc.rs       ────── CIPCBus
-    │     ├── security.rs   ────── SecurityEngine + SMTSolver (+ Z3PolicySolver with feature)
-    │     ├── umi.rs        ────── UnifiedModelInterface
-    │     ├── grid.rs       ────── CognitiveGrid (always compiled)
-    │     ├── embodiment.rs ────── EmbodimentLayer (feature: embodiment)
-    │     └── panic_log     ────── RwLock<Vec<PanicLog>>
+    │     ├── scheduler.rs     ────── TokenScheduler
+    │     ├── memory.rs        ────── HierarchicalMemoryManager
+    │     ├── cipc.rs          ────── CIPCBus
+    │     ├── security.rs      ────── SecurityEngine + SMTSolver (+ Z3PolicySolver with feature)
+    │     ├── umi.rs           ────── UnifiedModelInterface
+    │     ├── grid.rs          ────── CognitiveGrid (always compiled)
+    │     ├── embodiment.rs    ────── EmbodimentLayer (feature: embodiment)
+    │     ├── orchestrator.rs  ────── SubAgentOrchestrator
+    │     ├── audit_export.rs  ────── AuditExporter trait + impls
+    │     └── panic_log        ────── RwLock<Vec<PanicLog>>
     │
     └── create_router (api.rs)
           ├── /health
-          ├── /kernel/*       (5 endpoints)
-          ├── /memory/*       (8 endpoints)
-          ├── /cipc/*         (2 endpoints)
-          ├── /security/*     (2 endpoints)
-          ├── /umi/*          (6 endpoints)
-          ├── /sandbox/*      (3+1 endpoints, +1 with wasm-sandbox)
-          ├── /embodiment/*   (8 endpoints, feature: embodiment)
-          └── /grid/*         (7 endpoints, always on)
+          ├── /kernel/*         (5 endpoints)
+          ├── /scheduler/*      (2 endpoints)
+          ├── /memory/*         (8 endpoints)
+          ├── /cipc/*           (2 endpoints)
+          ├── /security/*       (3 endpoints, +1 export)
+          ├── /umi/*            (6 endpoints)
+          ├── /sandbox/*        (3+1 endpoints, +1 with wasm-sandbox)
+          ├── /workflow/*       (2 endpoints)
+          ├── /embodiment/*     (8 endpoints, feature: embodiment)
+          └── /grid/*           (7 endpoints, always on)
 ```
 
 Each kernel subsystem is an independent struct that is composed into `agOSKernel`. Subsystems do not call each other directly — all coordination happens through `kernel.rs` methods or through the REST handlers in `api.rs`.
@@ -77,6 +87,9 @@ Each kernel subsystem is an independent struct that is composed into `agOSKernel
 | `sandbox_wasm` | `wasmtime::Engine` | — | — (Engine is Send+Sync) |
 | `grid` | HashMap<String, PeerInfo>, Vec<GridMessage> | std::sync::Mutex | std::sync::Mutex |
 | `embodiment` | `HashMap<String, EmbodimentGoal>` + `HashMap<String, ActionPlan>` | `std::sync::Mutex` | std::sync::Mutex |
+| `orchestrator` | `HashMap<String, WorkflowInstance>` | `std::sync::Mutex` | std::sync::Mutex |
+| `audit_export` | Stateless (trait implementations) | — | — |
+| `telemetry` | Global OTLP tracer (static) | `opentelemetry::global` | Lock-free |
 
 ---
 
@@ -124,6 +137,11 @@ main()
   │
   ├─ 1. Initialize tracing subscriber (env-filter logging)
   │
+  ├─ 1b. init_telemetry()
+  │       └─ OTLP tracer pipeline (optional, no-op if OTLP endpoint unavailable)
+  │       └─ tracing_opentelemetry::layer() layered onto the registry
+  │       └─ Returns ShutdownGuard for graceful span flush
+  │
   ├─ 2. UnifiedModelInterface::new()
   │     └─ AtomicU32 set to DRIVER_LOCAL (0)
   │     └─ Static drivers already compiled: LOCAL_DRIVER, CLOUD_DRIVER
@@ -137,12 +155,16 @@ main()
   │     │   └─ Adds 3 constraints: blocked_actions, no_escalation, no_financial_transfer
   │     │   └─ (with feature z3-solver: wraps Z3PolicySolver in Mutex for Stage 1)
   │     ├─ CognitiveGrid::new(listen_addr)  — sets node_id from address
+  │     ├─ SubAgentOrchestrator::new()      — empty workflow map
   │     ├─ umi (passed in)
   │     ├─ (with feature embodiment: EmbodimentLayer::new())
   │     └─ panic_log: empty Vec
   │
   ├─ 4. create_router(kernel)
   │     └─ axum::Router with core routes
+  │     └─ + POST /scheduler/policy, GET /scheduler/policy
+  │     └─ + POST /workflow/run, GET /workflow/status/:id
+  │     └─ + POST /security/audit/export
   │     └─ (with feature wasm-sandbox: + POST /sandbox/execute)
   │     └─ (with feature embodiment: + 8 /embodiment/* routes)
   │     └─ 7 /grid/* routes (always compiled)
@@ -152,6 +174,7 @@ main()
   │
   └─ 6. axum::serve(listener, router)
         └─ HTTP server ready
+        └─ On SIGTERM/SIGINT: shutdown_guard flush spans
 ```
 
 ---
@@ -685,6 +708,144 @@ cargo test -- grid
 
 ---
 
+### orchestrator.rs — SubAgentOrchestrator
+
+The Orchestrator manages **workflow DAGs** defined in `.aapp` packages. Each workflow consists of sequential and/or parallel steps, each of which spawns a sub-agent (another `.aapp` process).
+
+#### Internal State
+
+```rust
+pub struct SubAgentOrchestrator {
+    workflows: Mutex<HashMap<String, WorkflowInstance>>,
+}
+```
+
+`WorkflowInstance` tracks the execution state:
+
+```rust
+pub struct WorkflowInstance {
+    pub id: String,
+    pub definition: WorkflowDefinition,
+    pub status: WorkflowStatus,
+    pub current_step: String,
+    pub steps: HashMap<String, StepInstance>,
+    pub created_at: String,
+}
+
+pub struct StepInstance {
+    pub status: StepStatus,            // Pending, Running, Succeeded, Failed, TimedOut
+    pub child_pid: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+```
+
+#### Key Methods
+
+| Method | Locking | Description |
+|--------|---------|-------------|
+| `create_workflow(def)` | Mutex write | Creates instance, validates DAG, sets initial step |
+| `advance_workflow(id, step_id, result)` | Mutex write | Advances to next step based on on_success/on_failure |
+| `get_status(id)` | Mutex read | Returns full instance details |
+| `list_workflows()` | Mutex read | Returns all instances |
+| `fail_workflow(id)` | Mutex write | Marks workflow as failed, cleans up children |
+
+#### DSL Parsing
+
+Workflows are parsed from `manifest.json` by `AAppLoader` in `sandbox.rs`. The DSL is a JSON array of steps, each supporting:
+- `id` — step identifier
+- `agent` — `.aapp` name to spawn
+- `timeout` — seconds before forced failure
+- `on_success` / `on_failure` — next step transitions
+- `parallel` — list of `{agent}` for concurrent execution
+- `join` — `"all"` or `"any"`
+
+#### Integration with Kernel
+
+The kernel orchestrator is called from workflow REST handlers:
+1. `POST /workflow/run` — loads the `.aapp`, checks for a `workflow` field in the manifest, creates a `WorkflowInstance`, and spawns the first step.
+2. `GET /workflow/status/:id` — reads current state from the orchestrator.
+
+---
+
+### audit_export.rs — AuditExporter
+
+Provides structured export of the security audit log to external sinks for compliance and SIEM integration.
+
+#### Trait Definition
+
+```rust
+#[async_trait]
+pub trait AuditExporter: Send + Sync {
+    async fn export(&self, entries: &[AuditEntry]) -> Result<(), String>;
+}
+```
+
+#### Implementations
+
+| Exporter | Sink ID | Description |
+|----------|---------|-------------|
+| `StdoutExporter` | `"stdout"` | Prints JSONL to stdout |
+| `JsonlFileExporter` | `"jsonl_file"` | Writes JSONL to a local file |
+| `S3Exporter` | `"s3"` | Uploads JSONL to S3-compatible object store via `rusty_s3` |
+
+#### Format Helpers
+
+```rust
+pub fn format_entries(entries: &[AuditEntry], format: &str) -> Result<String, String>
+```
+
+- `"jsonl"` — one JSON object per line, fields: `timestamp`, `action`, `result`, `reason`
+- `"csv"` — header row + data rows: `timestamp,action,result,reason`
+
+#### API Integration
+
+`POST /security/audit/export` accepts `{format, since, sink}` and:
+1. Filters in-memory audit entries by `since` (if provided).
+2. Calls `format_entries()` to produce the output string.
+3. Instantiates the exporter from the `sink` config and calls `export()`.
+
+---
+
+### telemetry.rs — OpenTelemetry Init
+
+Provides distributed tracing via OpenTelemetry's OTLP protocol, layered on top of the `tracing` ecosystem.
+
+#### Initialization
+
+```rust
+pub fn init_telemetry() -> Option<TelemetryGuard> {
+    let endpoint = std::env::var("OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+    // Creates OTLP exporter, installs simple span processor,
+    // returns a guard that flushes on Drop
+}
+```
+
+#### Integration with Tracing
+
+The OTLP layer is registered as a `tracing_subscriber::registry::Layer`:
+
+```rust
+let tracer = opentelemetry_otlp::new_pipeline()
+    .install_simple().ok()?;
+let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+registry.with(telemetry)
+```
+
+#### `#[instrument]` Usage
+
+Key handler and kernel methods are annotated with `#[instrument(skip(self, ...))]` to create spans that include function name, duration, and structured fields (PID, agent name, endpoint, etc.).
+
+#### Configuration
+
+| Env Variable | Default | Description |
+|-------------|---------|-------------|
+| `OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint |
+| `AGOS_SERVICE_NAME` | `agos-kernel` | Service name for trace identification |
+
+---
+
 ### api.rs — REST Router
 
 ```rust
@@ -728,11 +889,13 @@ async fn handler_name(
 |--------|-------|-------|
 | `/health` | 1 | GET only, no auth |
 | `/kernel/*` | 5 | spawn, kill, list, get, panic |
+| `/scheduler/*` | 2 | GET/POST policy |
 | `/memory/*` | 8 | l1 write/read, l2 compress, vector store, page-in, stats, episodic, episodic/compress |
 | `/cipc/*` | 2 | route, history |
-| `/security/*` | 2 | verify, audit |
+| `/security/*` | 3 | verify, audit, audit/export |
 | `/umi/*` | 6 | reason, embed, compress, switch, metrics |
 | `/sandbox/*` | 3 + 1 | install, launch, apps (+ execute with wasm-sandbox feature) |
+| `/workflow/*` | 2 | run, status/:id |
 | `/embodiment/*` | 8 | goal, goals, status, plan, clarify, execute, sensors, apps (with embodiment feature) |
 | `/grid/*` | 7 | join, peers, stats, heartbeat, migrate, receive, cipc/forward (always compiled) |
 
@@ -967,10 +1130,16 @@ if condition {
 | `tracing-subscriber` | 0.3 (env-filter) | Log level configuration via `RUST_LOG` |
 | `chrono` | 0.4 (serde) | Timestamps (RFC 3339) |
 | `tower` | 0.5 | Service layer for axum |
-| `async-trait` | 0.1 | (Reserved for future async trait use) |
+| `async-trait` | 0.1 | Async trait support for `AuditExporter` and `SchedulePolicy` |
 | `z3` | 0.7 (optional) | Z3 SMT solver integration |
 | `wasmtime` | 45 (optional) | WebAssembly runtime for sandbox tool execution |
-| `base64` | 0.22 (optional) | Base64 decode for WASM binary upload |
+| `base64` | 0.22 | Base64 decode for WASM binary upload + PEM parsing for keys |
+| `opentelemetry` | 0.27 | OpenTelemetry API for distributed tracing |
+| `opentelemetry-otlp` | 0.27 | OTLP exporter for OpenTelemetry spans |
+| `tracing-opentelemetry` | 0.28 | Bridge between `tracing` spans and OpenTelemetry |
+| `ed25519-dalek` | 2 | ED25519 signature verification for .aapp signing |
+| `sha2` | 0.10 | SHA-256 hashing for .aapp signing |
+| `rusty_s3` | 0.5 | S3-compatible object store client for audit export |
 
 ### Build Commands
 
@@ -1238,6 +1407,11 @@ The `Dockerfile` uses a multi-stage build (Rust builder → Debian slim runtime)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_LOG` | `info` | Logging level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `OTLP_ENDPOINT` | `http://localhost:4317` | OpenTelemetry OTLP gRPC endpoint |
+| `AGOS_SERVICE_NAME` | `agos-kernel` | Service name for OpenTelemetry traces |
+| `AGOS_TRUSTED_KEY` | _unset_ | PEM public key for .aapp signature verification (unset = skip) |
 | listen address | `127.0.0.1:7400` | Kernel HTTP API address (hard-coded in `main.rs`) |
 
 Authentication and API keys are configured at runtime via `POST /security/auth` (see [API Reference](API_REFERENCE.md)).
+
+**Note**: `AGOS_TRUSTED_KEY` controls .aapp signature verification. When set, every sandbox install checks `signature.sig` against this public key. When unset, verification is skipped — compatible with unsigned packages.

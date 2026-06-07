@@ -3,12 +3,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::audit_export::{AuditExporter, ExportFormat, ExportResult};
 use crate::auth::AuthConfig;
 use crate::cipc::CIPCBus;
 use crate::grid::CognitiveGrid;
 use crate::memory::HierarchicalMemoryManager;
+use crate::models::ModelRegistry;
+use crate::orchestrator::{SubAgentOrchestrator, WorkflowDefinition};
 use crate::scheduler::{CognitiveProcessContext, TokenScheduler};
 use crate::security::SecurityEngine;
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
+use crate::storage::{PersistentStore, SharedStore};
+use std::sync::Arc;
 use crate::umi::UnifiedModelInterface;
 
 #[cfg(feature = "embodiment")]
@@ -31,24 +37,69 @@ pub struct agOSKernel {
     pub umi: UnifiedModelInterface,
     pub grid: CognitiveGrid,
     pub auth: std::sync::Mutex<AuthConfig>,
+    pub store: SharedStore,
+    pub rate_limiter: RateLimiter,
+    pub model_registry: Arc<ModelRegistry>,
+    pub orchestrator: SubAgentOrchestrator,
     #[cfg(feature = "embodiment")]
     pub embodiment: EmbodimentLayer,
     panic_log: std::sync::RwLock<Vec<PanicLog>>,
 }
 
 impl agOSKernel {
-    pub fn new(umi: UnifiedModelInterface, listen_addr: &str) -> Self {
+    pub fn new(umi: UnifiedModelInterface, listen_addr: &str, db_path: Option<String>) -> Self {
+        let models_path = std::env::var("AGOS_MODELS_PATH").ok();
+        let model_registry = Arc::new(
+            models_path
+                .as_ref()
+                .and_then(|p| ModelRegistry::from_json_file(p).ok())
+                .unwrap_or_else(ModelRegistry::builtin),
+        );
+
+        let store: SharedStore = db_path
+            .map(|p| PersistentStore::open(&p).map(Arc::new))
+            .transpose()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to open persistent store: {}", e);
+                None
+            });
+
+        let store_for_memory = store.clone();
+        let store_for_security = store.clone();
+
+        let mut memory = HierarchicalMemoryManager::new();
+        let mut security = SecurityEngine::new();
+        memory.set_store(store_for_memory);
+        security.set_store(store_for_security);
+
+        let mut scheduler = TokenScheduler::new();
+        // share the same registry so scheduler model lookups
+        // always see the (possibly user-overridden) pricing data
+        scheduler.model_registry = model_registry.clone();
+
         agOSKernel {
-            scheduler: TokenScheduler::new(),
-            memory: HierarchicalMemoryManager::new(),
+            scheduler,
+            memory,
             cipc: CIPCBus::new(),
-            security: SecurityEngine::new(),
+            security,
             umi,
             grid: CognitiveGrid::new(listen_addr),
             auth: std::sync::Mutex::new(AuthConfig::default()),
+            rate_limiter: RateLimiter::new(RateLimitConfig::default()),
+            model_registry,
+            store,
+            orchestrator: SubAgentOrchestrator::new(),
             #[cfg(feature = "embodiment")]
             embodiment: EmbodimentLayer::new(),
             panic_log: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+
+    fn persist_panic(&self, entry: &PanicLog) {
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.append_panic(entry) {
+                tracing::warn!("Failed to persist panic log: {}", e);
+            }
         }
     }
 
@@ -104,6 +155,7 @@ impl agOSKernel {
         };
 
         self.panic_log.write().unwrap().push(entry.clone());
+        self.persist_panic(&entry);
 
         self.memory.log_episodic(
             pid,
@@ -134,6 +186,26 @@ impl agOSKernel {
 
     pub fn get_panic_log(&self) -> Vec<PanicLog> {
         self.panic_log.read().unwrap().clone()
+    }
+
+    pub fn list_models(&self) -> Vec<crate::models::TokenModel> {
+        self.model_registry.list().into_iter().cloned().collect()
+    }
+
+    pub async fn scheduler_policy_name(&self) -> &'static str {
+        self.scheduler.policy_name().await
+    }
+
+    pub async fn set_scheduler_policy(&self, name: &str) -> Result<(), String> {
+        let policy: Box<dyn crate::scheduler::SchedulePolicy> = match name {
+            "priority_preemption" => Box::new(crate::scheduler::PriorityPreemption),
+            "round_robin" => Box::new(crate::scheduler::RoundRobin),
+            "fifo" => Box::new(crate::scheduler::FIFO),
+            "token_aware" => Box::new(crate::scheduler::TokenAware),
+            _ => return Err(format!("Unknown scheduler policy: {}", name)),
+        };
+        self.scheduler.set_policy(policy).await;
+        Ok(())
     }
 
     pub fn hot_swap_umi(&self, driver_name: &str) -> Result<(), String> {
@@ -193,5 +265,48 @@ impl agOSKernel {
         );
 
         ctx
+    }
+
+    pub async fn export_audit_log(
+        &self,
+        format: &str,
+        sink: &str,
+        since: Option<&str>,
+        exporter: Box<dyn AuditExporter>,
+    ) -> Result<ExportResult, String> {
+        ExportFormat::from_str(format)?;
+        let mut entries = self.security.get_audit_log(usize::MAX);
+        if let Some(since_str) = since {
+            entries.retain(|e| e.timestamp.as_str() >= since_str);
+        }
+        let count = entries.len();
+        let result = ExportResult {
+            format: format.to_string(),
+            entries_exported: count,
+            sink: sink.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+        };
+        exporter.export(&entries).await?;
+        Ok(result)
+    }
+
+    pub async fn submit_workflow(
+        &self,
+        definition: WorkflowDefinition,
+    ) -> Result<crate::orchestrator::WorkflowInstance, String> {
+        let instance = self.orchestrator.submit_workflow(definition).await;
+        Ok(instance)
+    }
+
+    pub async fn execute_workflow(&self, workflow_id: &str) -> Result<(), String> {
+        self.orchestrator.execute_workflow(workflow_id, self).await
+    }
+
+    pub async fn list_workflows(&self) -> Vec<crate::orchestrator::WorkflowInstance> {
+        self.orchestrator.list_workflows().await
+    }
+
+    pub async fn get_workflow(&self, id: &str) -> Option<crate::orchestrator::WorkflowInstance> {
+        self.orchestrator.get_workflow(id).await
     }
 }

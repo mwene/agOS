@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agos-kernel-config
+  labels:
+    app: agos-kernel
+data:
+  RUST_LOG: "info"
+  AGOS_DB_PATH: "/data/kernel.db"
+  AGOS_MODELS_PATH: "/config/models.json"
+  AGOS_LISTEN_ADDR: "0.0.0.0:7400"

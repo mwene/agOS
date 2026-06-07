@@ -60,6 +60,7 @@ A `.aapp` package is a directory (or tarball) with this structure:
 your-agent/
 ├── manifest.json           # Required: identity, permissions, resource limits
 ├── logic_graphs.json       # Required: state machine definition
+├── signature.sig           # Optional: ED25519 signature (see Secure Signing)
 ├── tools/                  # Optional: tool schemas the agent exposes
 │   ├── tool_one.json
 │   └── tool_two.json
@@ -373,6 +374,127 @@ curl http://127.0.0.1:7400/kernel/processes
 
 ---
 
+## Sub-Agent Orchestration DSL
+
+Beyond flat state machines, `.aapp` packages can define **workflow DAGs** that spawn and coordinate multiple sub-agents. The orchestration DSL supports sequential steps, parallel execution with joins, and per-step timeouts.
+
+### Anatomy of a Workflow
+
+Workflows are defined inline in `manifest.json` under a `"workflow"` key:
+
+```json
+{
+  "name": "Financial Audit",
+  "workflow": {
+    "steps": [
+      {"id": "validate_balance", "agent": "BalanceChecker", "timeout": 30, "on_success": "verify_transactions", "on_failure": "flag_anomaly"},
+      {"id": "verify_transactions", "agent": "TransactionVerifier", "on_success": "generate_report"},
+      {"id": "generate_report", "agent": "ReportGenerator", "on_success": "__terminal__"}
+    ]
+  }
+}
+```
+
+### Step Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | yes | Unique step identifier within the workflow |
+| `agent` | string | yes | Name of the `.aapp` package to spawn as a sub-agent |
+| `timeout` | integer | no | Max seconds for the step before it is marked `TimedOut` |
+| `on_success` | string | no | Next step ID on success, or `__terminal__` to finish |
+| `on_failure` | string | no | Next step ID on failure (if omitted, the workflow fails) |
+| `parallel` | array | no | List of `{agent: string}` objects for parallel execution |
+
+### Parallel Steps
+
+```json
+{
+  "id": "verify_transactions",
+  "agent": "TransactionVerifier",
+  "parallel": [
+    {"agent": "FraudDetector"},
+    {"agent": "ComplianceChecker"}
+  ],
+  "join": "all",
+  "on_success": "generate_report"
+}
+```
+
+- `join: "all"` — wait for all parallel agents to complete before proceeding.
+- `join: "any"` — proceed when the first agent completes (race).
+
+### Running a Workflow
+
+```bash
+curl -X POST http://127.0.0.1:7400/workflow/run \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "financial_audit", "aapps_path": "aapps"}'
+```
+
+Response:
+```json
+{"workflow_id": "wf-abc123", "status": "running", "current_step": "validate_balance"}
+```
+
+### Checking Status
+
+```bash
+curl http://127.0.0.1:7400/workflow/status/wf-abc123
+```
+
+The orchestrator spawns each step's agent as a child cognitive process, monitors its lifecycle, and advances through the DAG automatically.
+
+---
+
+## Secure .aapp Signing
+
+`.aapp` packages can be cryptographically signed to prevent tampering. The kernel verifies the signature at install time and rejects packages with missing or invalid signatures.
+
+### The `agos-sign` CLI Tool
+
+```bash
+# Generate an ED25519 keypair
+cargo run -p agos-sign -- gen-key
+# Creates private.pem and public.pem
+
+# Sign a .aapp package
+cargo run -p agos-sign -- sign aapps/financial_auditor
+# Creates signature.sig inside the .aapp directory
+```
+
+### How It Works
+
+1. `agos-sign sign` walks all files in the `.aapp` directory (excluding `signature.sig`), concatenates them in a deterministic order, SHA-256 hashes the result, and signs the hash with the ED25519 private key.
+2. The signature is written as raw bytes to `signature.sig` in the `.aapp` directory.
+3. At install time, the kernel re-computes the hash and verifies it against the public key.
+
+### Enabling Verification
+
+Set the `AGOS_TRUSTED_KEY` environment variable to the PEM-encoded public key before starting the kernel:
+
+```bash
+export AGOS_TRUSTED_KEY="$(cat public.pem)"
+cargo run -p agos-kernel
+```
+
+- If `AGOS_TRUSTED_KEY` is **not set**, signature verification is **skipped** (backward compatible).
+- If it is set and the signature is missing or invalid, the install fails.
+
+### Install Result
+
+When signature verification is enabled, the install response includes:
+```json
+{
+  "status": "installed",
+  "name": "Financial Auditor",
+  "signature_valid": true,
+  ...
+}
+```
+
+---
+
 ## Inter-Agent Communication (cIPC)
 
 Agents communicate over the **Cognitive Inter-Process Communication (cIPC) bus**. Messages are structured JSON payloads with typed schemas.
@@ -574,3 +696,8 @@ The PID may have been terminated (panic, quota exhaustion, or explicit kill). Us
 | `POST` | `/security/verify` | Check if an action is permitted |
 | `GET` | `/memory/episodic` | View episodic ledger |
 | `GET` | `/memory/stats` | Memory statistics |
+| `GET` | `/scheduler/policy` | Get current scheduler policy |
+| `POST` | `/scheduler/policy` | Change scheduler policy |
+| `POST` | `/workflow/run` | Run a sub-agent workflow from a .aapp package |
+| `GET` | `/workflow/status/{id}` | Get workflow execution status |
+| `POST` | `/security/audit/export` | Export audit log to stdout/file/S3 |

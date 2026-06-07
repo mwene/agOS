@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agos-kernel
+  labels:
+    app: agos-kernel
+spec:
+  selector:
+    app: agos-kernel
+  ports:
+    - name: http-api
+      protocol: TCP
+      port: 7400
+      targetPort: 7400
+  type: ClusterIP

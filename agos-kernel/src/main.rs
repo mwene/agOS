@@ -4,22 +4,35 @@ use std::time::Duration;
 use agos_kernel::api::create_router;
 use agos_kernel::kernel::agOSKernel;
 use agos_kernel::umi::UnifiedModelInterface;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let use_otel = std::env::var("AGOS_OTLP_ENDPOINT").is_ok();
+    if use_otel {
+        if let Err(e) = agos_kernel::telemetry::init_tracer() {
+            eprintln!("Warning: Failed to init OpenTelemetry tracer: {}", e);
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+        }
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     tracing::info!("Bootstrapping agOS Kernel v0.1.0...");
 
     let umi = UnifiedModelInterface::new();
     let addr = "127.0.0.1:7400";
-    let kernel = Arc::new(agOSKernel::new(umi, addr));
+    let db_path = std::env::var("AGOS_DB_PATH").ok();
+    let kernel = Arc::new(agOSKernel::new(umi, addr, db_path));
 
     tracing::info!(
         "UMI drivers ready: LocalEngine-v0 (cap 2), CloudGPT-HighReason (cap 5)"
@@ -56,4 +69,6 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+
+    agos_kernel::telemetry::shutdown_tracer();
 }

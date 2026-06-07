@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
+use crate::storage::SharedStore;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorEntry {
     pub vector: Vec<f64>,
@@ -65,6 +67,7 @@ pub struct HierarchicalMemoryManager {
     compression_factor: f64,
     compressed_entries: AtomicU64,
     episodic_config: EpisodicConfig,
+    store: SharedStore,
 }
 
 impl Default for HierarchicalMemoryManager {
@@ -83,6 +86,7 @@ impl HierarchicalMemoryManager {
             compression_factor: 0.3,
             compressed_entries: AtomicU64::new(0),
             episodic_config: EpisodicConfig::default(),
+            store: None,
         }
     }
 
@@ -95,7 +99,12 @@ impl HierarchicalMemoryManager {
             compression_factor: 0.3,
             compressed_entries: AtomicU64::new(0),
             episodic_config: config,
+            store: None,
         }
+    }
+
+    pub fn set_store(&mut self, store: SharedStore) {
+        self.store = store;
     }
 
     pub fn episodic_config(&self) -> EpisodicConfig {
@@ -239,6 +248,11 @@ impl HierarchicalMemoryManager {
             timestamp: Utc::now().to_rfc3339(),
             event_id: Uuid::new_v4().to_string(),
         };
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.append_episodic(&entry) {
+                tracing::warn!("Failed to persist episodic entry: {}", e);
+            }
+        }
         let mut ledger = self.episodic_ledger.write().unwrap();
         ledger.push(entry.clone());
         entry

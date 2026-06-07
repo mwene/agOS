@@ -10,11 +10,20 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::instrument;
 
+use crate::audit_export::{JsonlExporter, StdoutExporter};
 use crate::kernel::agOSKernel;
+use crate::orchestrator::WorkflowDefinition;
 use crate::sandbox::{AAppLoader, InstallResult};
 
 type KernelState = Arc<agOSKernel>;
+
+fn check_rate_limit(kernel: &agOSKernel, key: &str) -> Result<(), Json<Value>> {
+    kernel.rate_limiter.check(key).map_err(|e| {
+        Json(serde_json::json!({"ok": false, "error": e}))
+    })
+}
 
 fn require_auth(kernel: &agOSKernel, headers: &HeaderMap) -> Result<(), (axum::http::StatusCode, Json<Value>)> {
     let auth = kernel.auth.lock().unwrap();
@@ -41,11 +50,14 @@ pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
 
     let router = Router::new()
         .route("/health", get(health_check))
+        .route("/models", get(list_models))
         .route("/kernel/spawn", post(kernel_spawn))
         .route("/kernel/kill", post(kernel_kill))
         .route("/kernel/processes", get(kernel_processes))
         .route("/kernel/process/:pid", get(kernel_process))
         .route("/kernel/panic", post(kernel_panic))
+        .route("/scheduler/policy", post(scheduler_set_policy))
+        .route("/scheduler/policy", get(scheduler_get_policy))
         .route("/memory/l1/write", post(memory_l1_write))
         .route("/memory/l1/:pid", get(memory_l1_read))
         .route("/memory/l2/compress", post(memory_l2_compress))
@@ -90,6 +102,11 @@ pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
         .route("/embodiment/apps", get(embodiment_apps));
 
     let router = router
+        .route("/security/audit/export", post(security_audit_export))
+        .route("/workflow/submit", post(workflow_submit))
+        .route("/workflow/execute", post(workflow_execute))
+        .route("/workflow/list", get(workflow_list))
+        .route("/workflow/:id", get(workflow_get))
         .route("/grid/join", post(grid_join))
         .route("/grid/peers", get(grid_peers))
         .route("/grid/stats", get(grid_stats))
@@ -101,6 +118,7 @@ pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
     router.layer(cors).with_state(kernel)
 }
 
+#[instrument]
 async fn health_check() -> Json<Value> {
     Json(serde_json::json!({
         "status": "ok",
@@ -108,14 +126,26 @@ async fn health_check() -> Json<Value> {
     }))
 }
 
+// ── Models ───────────────────────────────────────────────────
+
+async fn list_models(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let models = kernel.list_models();
+    Json(serde_json::json!({
+        "models": models
+    }))
+}
+
 // ── Kernel ──────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SpawnRequest {
     manifest: Value,
     parent_pid: Option<String>,
 }
 
+#[instrument(skip(kernel))]
 async fn kernel_spawn(
     State(kernel): State<KernelState>,
     Json(req): Json<SpawnRequest>,
@@ -129,11 +159,12 @@ async fn kernel_spawn(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct KillRequest {
     pid: String,
 }
 
+#[instrument(skip(kernel))]
 async fn kernel_kill(
     State(kernel): State<KernelState>,
     Json(req): Json<KillRequest>,
@@ -154,6 +185,41 @@ async fn kernel_process(
     match kernel.scheduler.get_process(&pid).await {
         Some(ctx) => Json(serde_json::json!({"process": ctx})),
         None => Json(serde_json::json!({"error": "Process not found", "pid": pid})),
+    }
+}
+
+// ── Scheduler ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetPolicyRequest {
+    policy: String,
+}
+
+async fn scheduler_get_policy(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let policy = kernel.scheduler_policy_name().await;
+    Json(serde_json::json!({
+        "policy": policy
+    }))
+}
+
+async fn scheduler_set_policy(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SetPolicyRequest>,
+) -> Json<Value> {
+    match kernel.set_scheduler_policy(&req.policy).await {
+        Ok(()) => {
+            let policy = kernel.scheduler_policy_name().await;
+            Json(serde_json::json!({
+                "status": "ok",
+                "policy": policy
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "status": "error",
+            "error": e
+        })),
     }
 }
 
@@ -187,6 +253,9 @@ async fn memory_l1_write(
     State(kernel): State<KernelState>,
     Json(req): Json<L1WriteRequest>,
 ) -> Json<Value> {
+    if let Err(resp) = check_rate_limit(&kernel, &format!("pid:{}", req.pid)) {
+        return resp;
+    }
     kernel.memory.write_l1(&req.pid, req.data);
     Json(serde_json::json!({"ok": true}))
 }
@@ -268,6 +337,9 @@ async fn cipc_route(
     State(kernel): State<KernelState>,
     Json(req): Json<CipcRouteRequest>,
 ) -> Json<Value> {
+    if let Err(resp) = check_rate_limit(&kernel, &format!("pid:{}", req.from)) {
+        return resp;
+    }
     match kernel.cipc.route(&req.from, &req.to, req.payload) {
         Ok(msg) => Json(serde_json::json!({"ok": true, "message_id": msg.id})),
         Err(e) => Json(serde_json::json!({"ok": false, "error": e})),
@@ -281,12 +353,13 @@ async fn cipc_history(State(kernel): State<KernelState>) -> Json<Value> {
 
 // ── Security ────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct VerifyRequest {
     action_vector: Value,
     permissions: Vec<String>,
 }
 
+#[instrument(skip(kernel))]
 async fn security_verify(
     State(kernel): State<KernelState>,
     Json(req): Json<VerifyRequest>,
@@ -354,6 +427,9 @@ async fn umi_reason(
     State(kernel): State<KernelState>,
     Json(req): Json<ReasonRequest>,
 ) -> Json<Value> {
+    if let Err(resp) = check_rate_limit(&kernel, "system:umi") {
+        return resp;
+    }
     let result = kernel.umi.reason(&req.prompt_vector, &Value::Null).await;
     Json(serde_json::json!({
         "output": result.output,
@@ -372,6 +448,9 @@ async fn umi_embed(
     State(kernel): State<KernelState>,
     Json(req): Json<EmbedRequest>,
 ) -> Json<Value> {
+    if let Err(resp) = check_rate_limit(&kernel, "system:umi") {
+        return resp;
+    }
     let embedding = kernel.umi.embed(&req.data);
     Json(serde_json::json!({"embedding": embedding, "driver": kernel.umi.active_name()}))
 }
@@ -583,6 +662,16 @@ async fn sandbox_install(
         None,
     );
 
+    let has_workflow = aapp.workflow.is_some();
+    let signature_valid = aapp.signature_valid;
+
+    if signature_valid == Some(false) {
+        return Json(serde_json::json!({
+            "error": "Signature verification failed for .aapp package",
+            "name": aapp.name,
+        }));
+    }
+
     Json(serde_json::json!(InstallResult {
         status: "installed".to_string(),
         name: aapp.name.clone(),
@@ -590,6 +679,8 @@ async fn sandbox_install(
         permissions,
         token_quota,
         states,
+        signature_valid,
+        has_workflow,
     }))
 }
 
@@ -815,6 +906,78 @@ async fn embodiment_sensors(State(kernel): State<KernelState>) -> Json<Value> {
 async fn embodiment_apps(State(kernel): State<KernelState>) -> Json<Value> {
     let apps = kernel.embodiment.list_agent_apps();
     Json(serde_json::json!({"apps": apps}))
+}
+
+// ── Security Audit Export ────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AuditExportRequest {
+    format: Option<String>,
+    sink: Option<String>,
+    since: Option<String>,
+}
+
+async fn security_audit_export(
+    State(kernel): State<KernelState>,
+    Json(req): Json<AuditExportRequest>,
+) -> Json<Value> {
+    let fmt = req.format.as_deref().unwrap_or("jsonl");
+    let sink = req.sink.as_deref().unwrap_or("stdout");
+    let since = req.since.as_deref();
+
+    let exporter: Box<dyn crate::audit_export::AuditExporter> = match sink {
+        "stdout" => Box::new(StdoutExporter),
+        path => Box::new(JsonlExporter::new(path)),
+    };
+
+    match kernel.export_audit_log(fmt, sink, since, exporter).await {
+        Ok(result) => Json(serde_json::json!({"ok": true, "export": result})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+// ── Workflow Orchestration ──────────────────────────────────
+
+async fn workflow_submit(
+    State(kernel): State<KernelState>,
+    Json(definition): Json<WorkflowDefinition>,
+) -> Json<Value> {
+    match kernel.submit_workflow(definition).await {
+        Ok(instance) => Json(serde_json::json!({"ok": true, "workflow": instance})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkflowExecuteRequest {
+    workflow_id: String,
+}
+
+async fn workflow_execute(
+    State(kernel): State<KernelState>,
+    Json(req): Json<WorkflowExecuteRequest>,
+) -> Json<Value> {
+    match kernel.execute_workflow(&req.workflow_id).await {
+        Ok(()) => Json(serde_json::json!({"ok": true, "workflow_id": req.workflow_id})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn workflow_list(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let workflows = kernel.list_workflows().await;
+    Json(serde_json::json!({"workflows": workflows, "count": workflows.len()}))
+}
+
+async fn workflow_get(
+    State(kernel): State<KernelState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match kernel.get_workflow(&id).await {
+        Some(wf) => Json(serde_json::json!({"workflow": wf})),
+        None => Json(serde_json::json!({"error": "Workflow not found"})),
+    }
 }
 
 // ── Grid ─────────────────────────────────────────────────────

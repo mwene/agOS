@@ -34,6 +34,7 @@ pub struct MigratingProcess {
     pub token_quota: u64,
     pub tokens_used: u64,
     pub priority: u32,
+    pub model: String,
     pub active_l1_context: Vec<Value>,
     pub state_machine: Value,
     pub parent_pid: Option<String>,
@@ -178,6 +179,7 @@ impl CognitiveGrid {
             token_quota: ctx.token_quota,
             tokens_used: ctx.tokens_used,
             priority: ctx.priority,
+            model: ctx.model.clone(),
             active_l1_context: ctx.active_l1_context.clone(),
             state_machine: ctx.state_machine.clone(),
             parent_pid: ctx.parent_pid.clone(),
@@ -194,6 +196,7 @@ impl CognitiveGrid {
         ctx.token_quota = incoming.token_quota;
         ctx.tokens_used = incoming.tokens_used;
         ctx.priority = incoming.priority;
+        ctx.model = incoming.model;
         ctx.active_l1_context = incoming.active_l1_context;
         ctx.state_machine = incoming.state_machine;
         ctx.parent_pid = incoming.parent_pid;
@@ -225,7 +228,7 @@ mod tests {
     use crate::umi::UnifiedModelInterface;
 
     fn test_kernel() -> Arc<agOSKernel> {
-        Arc::new(agOSKernel::new(UnifiedModelInterface::new(), "127.0.0.1:0"))
+        Arc::new(agOSKernel::new(UnifiedModelInterface::new(), "127.0.0.1:0", None))
     }
 
     #[test]
@@ -322,6 +325,7 @@ mod tests {
             token_quota: 1000,
             tokens_used: 100,
             priority: 2,
+            model: "gpt-4".to_string(),
             active_l1_context: vec![serde_json::json!({"key": "value"})],
             state_machine: Value::Null,
             parent_pid: None,

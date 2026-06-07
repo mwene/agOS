@@ -17,7 +17,9 @@ All requests and responses use `Content-Type: application/json`.
 - [UMI — Unified Model Interface](#umi--unified-model-interface)
 - [Driver Management](#driver-management)
 - [Sandbox](#sandbox)
+- [Scheduler](#scheduler)
 - [WASM Sandbox](#wasm-sandbox-feature-wasm-sandbox)
+- [Workflow Orchestration](#workflow-orchestration)
 - [Embodiment](#embodiment-feature-embodiment)
 - [Grid — Decentralised Cognitive Grids](#grid--decentralised-cognitive-grids)
 
@@ -254,6 +256,33 @@ Response:
 {"entries": [...], "count": ..., "allowed": ..., "denied": ...}
 ```
 
+### `POST /security/audit/export` — Export audit log to external sink
+
+```json
+{"format": "jsonl", "since": "2026-06-01T00:00:00Z", "sink": {"type": "stdout"}}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `format` | string | yes | `"jsonl"` or `"csv"` |
+| `since` | string | no | ISO 8601 timestamp; only entries after this time are included |
+| `sink.type` | string | yes | `"stdout"`, `"jsonl_file"`, or `"s3"` |
+| `sink.path` | string | for `jsonl_file` | Local file path to write to |
+| `sink.bucket` | string | for `s3` | S3 bucket name |
+| `sink.key` | string | for `s3` | S3 object key |
+| `sink.endpoint` | string | for `s3` | S3-compatible endpoint URL |
+| `sink.region` | string | for `s3` | AWS region (default: `us-east-1`) |
+
+Response:
+```json
+{"ok": true, "exported": 12, "format": "jsonl", "sink": "stdout"}
+```
+
+Error:
+```json
+{"ok": false, "error": "Unsupported sink type: 'splunk'"}
+```
+
 ---
 
 ## UMI — Unified Model Interface
@@ -439,6 +468,35 @@ Response:
 
 ---
 
+## Scheduler
+
+### `GET /scheduler/policy` — Get current scheduler policy
+
+Response:
+```json
+{"policy": "priority_preemption"}
+```
+
+### `POST /scheduler/policy` — Change scheduler policy
+
+```json
+{"policy": "round_robin"}
+```
+
+Supported policies: `"priority_preemption"`, `"round_robin"`, `"fifo"`, `"token_aware"`.
+
+Response:
+```json
+{"ok": true, "policy": "round_robin"}
+```
+
+Error:
+```json
+{"ok": false, "error": "Unknown policy: 'unknown'"}
+```
+
+---
+
 ## WASM Sandbox (feature `wasm-sandbox`)
 
 ### `POST /sandbox/execute` — Execute a WASM module
@@ -450,6 +508,43 @@ Response:
 Response:
 ```json
 {"ok": true, "result": "..."}
+```
+
+---
+
+## Workflow Orchestration
+
+### `POST /workflow/run` — Run a workflow from a .aapp package
+
+```json
+{"name": "financial_audit", "aapps_path": "aapps"}
+```
+
+Response:
+```json
+{"workflow_id": "wf-abc123", "status": "running", "current_step": "validate_balance"}
+```
+
+### `GET /workflow/status/:id` — Get workflow status
+
+Response:
+```json
+{
+  "workflow_id": "wf-abc123",
+  "status": "running",
+  "definition": {"steps": [...]},
+  "current_step": "verify_transactions",
+  "steps": {
+    "validate_balance": {"status": "succeeded", "child_pid": "proc-...", "started_at": "...", "completed_at": "..."},
+    "verify_transactions": {"status": "running", "child_pid": "proc-...", "started_at": "..."}
+  },
+  "created_at": "..."
+}
+```
+
+Error:
+```json
+{"error": "Workflow not found", "workflow_id": "wf-nonexistent"}
 ```
 
 ---

@@ -1,6 +1,0 @@
-Confirm there is a way for the agOS user or admin user to easy configure, check and download drivers.
-It should be possible to easily deploy the agOS to bare-metal, virtual machine or container environments. Add those capabilities and update documentation.
-Write a full and comprehensive agOS API documentation.
-
-Also, agOS user should be able to configure the drivers with API keys and other required details as per the driver creator requirements. Also confirm there is a way for the agOS user to configure authentication to the agOS APIs and also secure agent communications.
-

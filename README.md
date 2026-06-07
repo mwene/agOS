@@ -71,7 +71,14 @@ agos/
 │       ├── sandbox_wasm.rs        # WebAssembly sandbox (feature: wasm-sandbox)
 │       ├── embodiment.rs          # Embodiment VLA pipeline (feature: embodiment)
 │       ├── grid.rs                # Decentralized Cognitive Grids
+│       ├── orchestrator.rs        # Sub-Agent Orchestration DSL runner
+│       ├── audit_export.rs        # Structured audit export (JSONL/CSV to stdout/file/S3)
+│       ├── telemetry.rs           # OpenTelemetry OTLP tracing init
 │       └── api.rs                 # axum REST API handlers (35+ endpoints)
+│
+├── agos-sign/                     # .aapp signing CLI tool (ED25519)
+│   ├── Cargo.toml
+│   └── src/main.rs
 │
 ├── agos-demo/                     # Java Spring Boot demo UI (port 8080)
 │   ├── pom.xml
@@ -147,6 +154,11 @@ Some endpoints require feature flags:
 | `wasm-sandbox` | `--features wasm-sandbox` | `POST /sandbox/execute` |
 | `embodiment` | `--features embodiment` | 8 `/embodiment/*` endpoints |
 | `grid` | _always on_ | 7 `/grid/*` endpoints, no feature flag |
+| OpenTelemetry | _always on_ | No additional endpoints; adds `#[instrument]` spans |
+| Sub-Agent Orchestration | _always on_ | `POST /workflow/run`, `GET /workflow/status/:id` |
+| Structured Audit Export | _always on_ | `POST /security/audit/export` |
+| Scheduler Policies | _always on_ | `GET /scheduler/policy`, `POST /scheduler/policy` |
+| `.aapp` Signing | _always on_ | No additional endpoints; `AGOS_TRUSTED_KEY` env var |
 
 Run with all features:
 ```bash
@@ -183,12 +195,20 @@ cargo run --features "z3-solver,wasm-sandbox,embodiment"
 | `POST` | `/cipc/route` | Route a structured message |
 | `GET` | `/cipc/history` | Message history |
 
+### Scheduler
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/scheduler/policy` | Get current scheduling policy |
+| `POST` | `/scheduler/policy` | Change scheduling policy |
+
 ### Security
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/security/verify` | Ring 0 SMT verification |
 | `GET` | `/security/audit` | Audit log |
+| `POST` | `/security/audit/export` | Export audit log (JSONL/CSV to stdout/file/S3) |
 
 ### UMI
 
@@ -208,6 +228,13 @@ cargo run --features "z3-solver,wasm-sandbox,embodiment"
 | `POST` | `/sandbox/launch` | — | Launch installed app |
 | `GET` | `/sandbox/apps` | — | List available apps |
 | `POST` | `/sandbox/execute` | `wasm-sandbox` | Execute WASM tool |
+
+### Workflow Orchestration
+
+| Method | Path | Feature | Description |
+|--------|------|---------|-------------|
+| `POST` | `/workflow/run` | — | Run a sub-agent workflow from a .aapp package |
+| `GET` | `/workflow/status/{id}` | — | Get workflow execution status |
 
 ### Embodiment
 
@@ -297,14 +324,14 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 | Feature | Status |
 |---------|--------|
 | Phase 10 — Decentralized Cognitive Grids | ✓ Complete |
+| OpenTelemetry Instrumentation | ✓ Complete |
+| Kubernetes Operator | ✓ Complete |
+| Pluggable Scheduler Policies | ✓ Complete |
+| Sub-Agent Orchestration DSL | ✓ Complete |
+| Secure .aapp Signing | ✓ Complete |
+| Structured Audit Export | ✓ Complete |
 | Persistent Storage (SQLite) | Planned |
-| Pluggable Scheduler Policies | Planned |
-| Sub-Agent Orchestration DSL | Planned |
-| Secure .aapp Signing | Planned |
 | Rate Limiting and QoS | Planned |
-| OpenTelemetry Instrumentation | Planned |
-| Kubernetes Operator | Planned |
-| Structured Audit Export | Planned |
 | Token Accounting with Real Models | Planned |
 
 ---
