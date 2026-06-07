@@ -1,0 +1,13 @@
+{
+  "name": "take_customer_order",
+  "description": "Ask the customer for their order and record each item",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id", "items"],
+    "properties": {
+      "customer_id": {"type": "string", "description": "Customer identifier"},
+      "items": {"type": "array", "items": {"type": "string"}, "description": "List of ordered items"},
+      "notes": {"type": "string", "description": "Special instructions or allergies"}
+    }
+  }
+}

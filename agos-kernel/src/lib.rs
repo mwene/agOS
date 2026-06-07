@@ -23,3 +23,12 @@ pub mod sandbox_wasm;
 
 #[cfg(feature = "embodiment")]
 pub mod embodiment;
+
+#[cfg(feature = "uri")]
+pub mod uri;
+
+#[cfg(feature = "uri")]
+pub mod controller;
+
+#[cfg(all(feature = "uri", feature = "wasm-sandbox"))]
+pub mod uri_wasm;

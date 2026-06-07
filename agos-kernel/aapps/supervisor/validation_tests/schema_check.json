@@ -1,0 +1,1 @@
+{"test_id": "supervisor-schema-001", "assertions": [{"field": "complaint_id", "operator": "exists"}, {"field": "customer_id", "operator": "exists"}]}

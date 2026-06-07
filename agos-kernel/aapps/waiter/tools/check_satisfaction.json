@@ -1,0 +1,13 @@
+{
+  "name": "check_customer_satisfaction",
+  "description": "Ask the customer if everything is satisfactory with their meal",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id", "order_id"],
+    "properties": {
+      "customer_id": {"type": "string"},
+      "order_id": {"type": "string"},
+      "satisfied": {"type": "boolean", "description": "Whether the customer is satisfied"}
+    }
+  }
+}

@@ -20,6 +20,8 @@ This guide covers the internal architecture, module interfaces, concurrency mode
   - [z3_solver.rs — Z3PolicySolver](#z3_solversr--z3policysolver)
   - [sandbox_wasm.rs — WasmSandbox](#sandbox_wasmrs--wasmsandbox)
   - [embodiment.rs — EmbodimentLayer](#embodimentrs--embodimentlayer)
+  - [uri.rs — UnifiedRoboticsInterface](#urirs--unifiedroboticsinterface)
+  - [controller.rs — ControllerManager](#controllersr--controllermanager)
   - [grid.rs — CognitiveGrid](#gridrs--cognitifrid)
   - [orchestrator.rs — SubAgentOrchestrator](#orchestratorrs--subagentorchestrator)
   - [audit_export.rs — AuditExporter](#audit_exportrs--auditexporter)
@@ -50,9 +52,11 @@ This guide covers the internal architecture, module interfaces, concurrency mode
     │     ├── cipc.rs          ────── CIPCBus
     │     ├── security.rs      ────── SecurityEngine + SMTSolver (+ Z3PolicySolver with feature)
     │     ├── umi.rs           ────── UnifiedModelInterface
-    │     ├── grid.rs          ────── CognitiveGrid (always compiled)
-    │     ├── embodiment.rs    ────── EmbodimentLayer (feature: embodiment)
-    │     ├── orchestrator.rs  ────── SubAgentOrchestrator
+│     ├── grid.rs          ────── CognitiveGrid (always compiled)
+│     ├── uri.rs           ────── UnifiedRoboticsInterface (feature: uri)
+│     ├── controller.rs    ────── ControllerManager (feature: uri)
+│     ├── embodiment.rs    ────── EmbodimentLayer (feature: embodiment)
+│     ├── orchestrator.rs  ────── SubAgentOrchestrator
     │     ├── audit_export.rs  ────── AuditExporter trait + impls
     │     └── panic_log        ────── RwLock<Vec<PanicLog>>
     │
@@ -66,8 +70,10 @@ This guide covers the internal architecture, module interfaces, concurrency mode
           ├── /umi/*            (6 endpoints)
           ├── /sandbox/*        (3+1 endpoints, +1 with wasm-sandbox)
           ├── /workflow/*       (2 endpoints)
-          ├── /embodiment/*     (8 endpoints, feature: embodiment)
-          └── /grid/*           (7 endpoints, always on)
+      ├── /embodiment/*     (8 endpoints, feature: embodiment)
+      ├── /uri/*            (10 endpoints, feature: uri)
+      ├── /controller/*     (17 endpoints, feature: uri)
+      └── /grid/*           (7 endpoints, always on)
 ```
 
 Each kernel subsystem is an independent struct that is composed into `agOSKernel`. Subsystems do not call each other directly — all coordination happens through `kernel.rs` methods or through the REST handlers in `api.rs`.
@@ -86,6 +92,8 @@ Each kernel subsystem is an independent struct that is composed into `agOSKernel
 | `z3_solver` | `Context + Solver (behind Mutex)` | — | std::sync::Mutex |
 | `sandbox_wasm` | `wasmtime::Engine` | — | — (Engine is Send+Sync) |
 | `grid` | HashMap<String, PeerInfo>, Vec<GridMessage> | std::sync::Mutex | std::sync::Mutex |
+| `uri` | DashMap for drivers and devices | std::sync::RwLock | std::sync::RwLock |
+| `controller` | HashMap for PID/trajectory/safety state | std::sync::Mutex | std::sync::Mutex |
 | `embodiment` | `HashMap<String, EmbodimentGoal>` + `HashMap<String, ActionPlan>` | `std::sync::Mutex` | std::sync::Mutex |
 | `orchestrator` | `HashMap<String, WorkflowInstance>` | `std::sync::Mutex` | std::sync::Mutex |
 | `audit_export` | Stateless (trait implementations) | — | — |
@@ -113,15 +121,20 @@ Each kernel subsystem is an independent struct that is composed into `agOSKernel
     ┌─────────┐    ┌──────────┐    ┌────────────┐
     │  cipc   │    │   umi    │    │  sandbox   │
     └─────────┘    └──────────┘    └────────────┘
-                         │
-                         ▼
-                   ┌──────────┐
-                   │  grid    │  ← always compiled, no feature gate
-                   └──────────┘
-                   ┌──────────┐
-                   │DriverState│
-                   │ (statics) │
-                   └──────────┘
+                          │
+                          ▼
+                    ┌──────────┐
+                    │  grid    │  ← always compiled, no feature gate
+                    └──────────┘
+                    ┌──────────┐
+                    │DriverState│
+                    │ (statics) │
+                    └──────────┘
+                    ┌──────────┐       ┌──────────────┐
+                    │   uri    │       │  controller  │ ← feature: uri
+                    │ (feature)│──────>│ (PID, traj,  │
+                    │ drivers  │       │  safety, xfm)│
+                    └──────────┘       └──────────────┘
 ```
 
 - **api.rs** depends on `kernel` and `sandbox` directly.
@@ -158,6 +171,7 @@ main()
   │     ├─ SubAgentOrchestrator::new()      — empty workflow map
   │     ├─ umi (passed in)
   │     ├─ (with feature embodiment: EmbodimentLayer::new())
+  │     ├─ (with feature uri: UnifiedRoboticsInterface::new())
   │     └─ panic_log: empty Vec
   │
   ├─ 4. create_router(kernel)
@@ -167,6 +181,7 @@ main()
   │     └─ + POST /security/audit/export
   │     └─ (with feature wasm-sandbox: + POST /sandbox/execute)
   │     └─ (with feature embodiment: + 8 /embodiment/* routes)
+  │     └─ (with feature uri: + 10 /uri/* + 17 /controller/* routes)
   │     └─ 7 /grid/* routes (always compiled)
   │     └─ CORS layer (allow all origins/methods/headers)
   │
@@ -193,6 +208,10 @@ pub struct agOSKernel {
     pub security: SecurityEngine,
     pub umi: UnifiedModelInterface,
     pub grid: CognitiveGrid,
+    #[cfg(feature = "uri")]
+    pub uri: UnifiedRoboticsInterface,
+    #[cfg(feature = "uri")]
+    pub controller: ControllerManager,
     panic_log: RwLock<Vec<PanicLog>>,
 }
 ```
@@ -634,7 +653,191 @@ cargo test --features embodiment
 
 ---
 
-### grid.rs — CognitiveGrid
+### uri.rs — UnifiedRoboticsInterface
+
+The URI (Unified Robotics Interface) provides a hardware abstraction layer for sensors, actuators, and data transform pipelines — analogous to how UMI abstracts AI model inference.
+
+```rust
+pub struct UnifiedRoboticsInterface {
+    drivers: RwLock<HashMap<String, HardwareDriver>>,
+    devices: RwLock<HashMap<String, DeviceState>>,
+    transforms: RwLock<Vec<DataTransform>>,
+}
+```
+
+#### Key Types
+
+```rust
+pub struct HardwareDriver {
+    pub name: String,
+    pub driver_type: DriverType,    // Builtin, Runtime, Simulated
+    pub capabilities: Vec<String>,  // e.g. ["sensor:temperature", "actuator:servo"]
+    pub status: DriverStatus,       // Online, Offline, Error
+    pub config: Value,              // driver-specific configuration
+}
+
+pub struct DeviceState {
+    pub device_id: String,
+    pub driver: String,
+    pub last_value: Value,
+    pub last_read: String,
+    pub unit: String,
+}
+
+pub struct DataTransform {
+    pub name: String,
+    pub pipeline: Vec<TransformStep>,
+}
+
+pub enum TransformStep {
+    Normalize { min: f64, max: f64 },
+    Scale { factor: f64, offset: f64 },
+    Threshold { lower: f64, upper: f64 },
+    MovingAverage { window: usize },
+    Custom { name: String, params: Value },
+}
+```
+
+#### Key Methods
+
+| Method | Async? | Locking | Description |
+|--------|--------|---------|-------------|
+| `sense(device_id, driver_name)` | no | RwLock read | Reads the current value of a device via its driver |
+| `actuate(device_id, value, driver_name)` | no | RwLock read + write | Writes a value to an actuator via its driver |
+| `transform(name, data)` | no | RwLock read | Applies a named pipeline of data transforms |
+| `status(device_id)` | no | RwLock read | Returns driver + device status info |
+| `switch(driver_name)` | no | RwLock write | Changes the active backend driver for a device |
+| `register_driver(...)` | no | RwLock write | Registers a new runtime hardware driver |
+| `unregister_driver(name)` | no | RwLock write | Removes a runtime hardware driver |
+| `get_metrics()` | no | RwLock read | Returns per-driver call/error counters |
+| `list_drivers()` | no | RwLock read | Lists all registered hardware drivers |
+
+#### Concurrency
+
+Uses `std::sync::RwLock` for driver/device/transform maps. Lock duration is negligible (HashMap lookups) — no `.await` held across locks.
+
+#### Feature Gate
+
+- Feature: `uri` (no external dependencies).
+- Field: `pub uri: UnifiedRoboticsInterface` on `agOSKernel` behind `#[cfg(feature = "uri")]`.
+- Routes: 10 endpoints under `/uri/*`.
+- Ships with 4 built-in drivers: `SimulatedTemperature`, `SimulatedServo`, `SimulatedDistance`, `SimulatedIMU`.
+
+---
+
+### controller.rs — ControllerManager
+
+The Controller Manager provides real-time control primitives: PID controllers, trajectory planning, safety monitors, and coordinate transforms.
+
+```rust
+pub struct ControllerManager {
+    pid_controllers: Mutex<HashMap<String, PIDController>>,
+    trajectories: Mutex<HashMap<String, TrajectoryPlan>>,
+    safety_monitors: Mutex<HashMap<String, SafetyMonitor>>,
+    transforms: Mutex<HashMap<String, Transform3D>>,
+    event_log: Mutex<Vec<SafetyEvent>>,
+    stats: Mutex<ControllerStats>,
+}
+```
+
+#### Key Types
+
+```rust
+pub struct PIDController {
+    pub id: String,
+    pub kp: f64, pub ki: f64, pub kd: f64,
+    pub setpoint: f64,
+    pub integral: f64,
+    pub prev_error: f64,
+    pub dt: f64,
+    pub output_limits: (f64, f64),
+    pub last_update: String,
+}
+
+pub struct TrajectoryPlan {
+    pub id: String,
+    pub waypoints: Vec<TrajectoryWaypoint>,
+    pub current_index: usize,
+    pub status: TrajectoryStatus,    // Idle, Running, Completed, Paused, Failed
+    pub interpolation: InterpolationMode, // Linear, Cubic, Spline
+    pub created_at: String,
+}
+
+pub struct SafetyMonitor {
+    pub id: String,
+    pub device_id: String,
+    pub condition: SafetyCondition,  // ThresholdAbove, ThresholdBelow, RateOfChange, Window
+    pub threshold: f64,
+    pub window_secs: Option<f64>,
+    pub triggered: bool,
+    pub created_at: String,
+}
+
+pub struct SafetyEvent {
+    pub id: String,
+    pub device_id: String,
+    pub event_type: String,          // ESTOP_TRIGGERED, LIMIT_EXCEEDED, MONITOR_TRIGGERED
+    pub message: String,
+    pub timestamp: String,
+    pub cleared: bool,
+}
+```
+
+#### Key Methods
+
+| Method | Locking | Description |
+|--------|---------|-------------|
+| `create_pid(cfg)` | Mutex write | Creates a PID controller with given gains and limits |
+| `list_pid()` | Mutex read | Returns all PID controllers |
+| `set_pid_setpoint(id, sp)` | Mutex write | Updates the setpoint of a PID controller |
+| `pid_step(id, measurement)` | Mutex write | Executes one control step: error → P+I+D → clamped output |
+| `create_trajectory(plan)` | Mutex write | Creates a trajectory with waypoints and interpolation mode |
+| `list_trajectories()` | Mutex read | Returns all trajectory plans |
+| `start_trajectory(id)` | Mutex write | Resets to waypoint 0, marks Running |
+| `trajectory_step(id)` | Mutex write | Advances to next waypoint, returns current target |
+| `create_safety_monitor(cfg)` | Mutex write | Creates a safety condition monitor |
+| `check_safety(device_id, value)` | Mutex read | Checks all monitors for a device; returns triggered list |
+| `trigger_estop(device_id, reason)` | Mutex write | Logs an ESTOP event for the device |
+| `clear_estop(device_id)` | Mutex write | Clears unresolved ESTOP events for the device |
+| `list_monitors()` | Mutex read | Returns all safety monitors |
+| `events_for_device(device_id)` | Mutex read | Returns safety events for a given device |
+| `add_transform(name, xform)` | Mutex write | Adds a named 4×4 coordinate transform |
+| `list_transforms()` | Mutex read | Returns all registered transforms |
+| `stats()` | Mutex read | Returns controller statistics |
+
+#### Safety Event Flow
+
+```
+trigger_estop(device_id, reason)
+  ├─ Creates SafetyEvent { event_type: "ESTOP_TRIGGERED", cleared: false }
+  ├─ Logs to event_log
+  └─ Returns the event
+
+clear_estop(device_id)
+  ├─ Finds all unresolved ESTOP events for device
+  ├─ Sets cleared: true
+  └─ Logs "ESTOP_CLEARED" event
+```
+
+All safety endpoints require `#[cfg(feature = "uri")]` — no effect when feature is disabled.
+
+#### Feature Gate
+
+- Feature: `uri` (shares feature flag with URI).
+- Field: `pub controller: ControllerManager` on `agOSKernel` behind `#[cfg(feature = "uri")]`.
+- Routes: 17 endpoints under `/controller/*`.
+
+#### Testing
+
+```bash
+cargo test --features uri
+# PID tests: create, setpoint, step
+# Trajectory tests: create, start, step
+# Safety tests: create monitor, check, estop, clear, events
+# Transform tests: add, list
+```
+
+---
 
 The Grid module implements **decentralised multi-node agent orchestration** — peer discovery, heartbeat liveness tracking, and agent migration. Unlike optional subsystems (Z3, WASM, Embodiment), the grid is **always compiled** (no feature gate).
 
@@ -897,6 +1100,8 @@ async fn handler_name(
 | `/sandbox/*` | 3 + 1 | install, launch, apps (+ execute with wasm-sandbox feature) |
 | `/workflow/*` | 2 | run, status/:id |
 | `/embodiment/*` | 8 | goal, goals, status, plan, clarify, execute, sensors, apps (with embodiment feature) |
+| `/uri/*` | 10 | sense, actuate, transform, status, switch, metrics, drivers (with uri feature) |
+| `/controller/*` | 17 | PID, trajectory, safety, estop, transform, stats (with uri feature) |
 | `/grid/*` | 7 | join, peers, stats, heartbeat, migrate, receive, cipc/forward (always compiled) |
 
 ---
@@ -1148,7 +1353,7 @@ if condition {
 cargo build
 
 # Build with optional features
-cargo build --features "z3-solver,wasm-sandbox,embodiment"
+cargo build --features "z3-solver,wasm-sandbox,embodiment,uri"
 
 # Build (release)
 cargo build --release
@@ -1166,7 +1371,7 @@ cargo fmt
 cargo test
 
 # Run all tests with all features
-cargo test --features "z3-solver,wasm-sandbox,embodiment"
+cargo test --features "z3-solver,wasm-sandbox,embodiment,uri"
 ```
 
 ### Logging
@@ -1237,8 +1442,11 @@ cargo test --features wasm-sandbox
 # With embodiment (+22 = 40 tests)
 cargo test --features embodiment
 
-# All features (46 tests: 22 embodiment + 9 memory + 2 sandbox + 4 Z3 + 9 grid)
-cargo test --features "z3-solver,wasm-sandbox,embodiment"
+# With uri (+10 = 28 tests)
+cargo test --features uri
+
+# All features (56 tests: 22 embodiment + 9 memory + 2 sandbox + 4 Z3 + 9 grid + 10 URI+controller)
+cargo test --features "z3-solver,wasm-sandbox,embodiment,uri"
 ```
 
 Example test structure (from the pattern in each module):

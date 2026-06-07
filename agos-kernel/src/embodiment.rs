@@ -756,7 +756,7 @@ mod tests {
     use crate::umi::UnifiedModelInterface;
 
     fn test_kernel() -> Arc<agOSKernel> {
-        Arc::new(agOSKernel::new(UnifiedModelInterface::new(), "127.0.0.1:0"))
+        Arc::new(agOSKernel::new(UnifiedModelInterface::new(), "127.0.0.1:0", None))
     }
 
     #[test]

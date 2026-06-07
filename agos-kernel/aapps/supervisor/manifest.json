@@ -1,0 +1,9 @@
+{
+  "name": "Supervisor",
+  "version": "1.0.0",
+  "description": "Robotic restaurant supervisor — monitor service, resolve issues, quality checks, shift reports",
+  "permissions": ["cipc:communicate", "memory:page", "scheduler:spawn"],
+  "limits": { "max_tokens": 4000, "max_subagents": 3 },
+  "priority": 3,
+  "goal_metric": 0.99
+}

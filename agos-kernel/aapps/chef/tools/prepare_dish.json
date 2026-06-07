@@ -1,0 +1,14 @@
+{
+  "name": "prepare_dish",
+  "description": "Prepare a dish according to the order specification",
+  "input_schema": {
+    "type": "object",
+    "required": ["order_id", "dish_name"],
+    "properties": {
+      "order_id": {"type": "string"},
+      "dish_name": {"type": "string"},
+      "quantity": {"type": "integer", "default": 1},
+      "special_instructions": {"type": "string"}
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"test_id": "waiter-schema-001", "assertions": [{"field": "customer_id", "operator": "exists"}, {"field": "order_id", "operator": "exists"}]}

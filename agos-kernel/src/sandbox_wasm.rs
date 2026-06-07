@@ -128,7 +128,7 @@ mod tests {
     fn test_wasm_execute_simple() {
         let sandbox = WasmSandbox::new().unwrap();
         let umi = UnifiedModelInterface::new();
-        let kernel = Arc::new(agOSKernel::new(umi, "127.0.0.1:0"));
+        let kernel = Arc::new(agOSKernel::new(umi, "127.0.0.1:0", None));
 
         let wasm_bytes = wat::parse_str(ADD_WAT).expect("WAT parse");
         let input = serde_json::json!({"a": 1, "b": 2});

@@ -1,0 +1,13 @@
+{
+  "name": "verify_order_accuracy",
+  "description": "Check that the prepared order matches what the customer ordered",
+  "input_schema": {
+    "type": "object",
+    "required": ["order_id", "ordered_items", "prepared_items"],
+    "properties": {
+      "order_id": {"type": "string"},
+      "ordered_items": {"type": "array", "items": {"type": "string"}},
+      "prepared_items": {"type": "array", "items": {"type": "string"}}
+    }
+  }
+}

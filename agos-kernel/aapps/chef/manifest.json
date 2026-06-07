@@ -1,0 +1,9 @@
+{
+  "name": "Chef",
+  "version": "1.0.0",
+  "description": "Robotic kitchen chef — receive orders, prepare dishes, hand off to waiter",
+  "permissions": ["cipc:communicate", "memory:page"],
+  "limits": { "max_tokens": 3000, "max_subagents": 2 },
+  "priority": 2,
+  "goal_metric": 0.98
+}

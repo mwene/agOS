@@ -1,0 +1,35 @@
+{
+  "initial_state": "wait_for_customer",
+  "states": {
+    "wait_for_customer": {
+      "transitions": { "customer_arrived": "greet_customer" }
+    },
+    "greet_customer": {
+      "transitions": { "welcomed": "take_order" }
+    },
+    "take_order": {
+      "transitions": { "order_taken": "transmit_to_chef", "need_clarification": "take_order" }
+    },
+    "transmit_to_chef": {
+      "transitions": { "order_sent": "pick_up_order", "transmit_failed": "transmit_to_chef" }
+    },
+    "pick_up_order": {
+      "transitions": { "order_received": "verify_order", "not_ready": "pick_up_order" }
+    },
+    "verify_order": {
+      "transitions": { "verified": "serve_customer", "incorrect": "transmit_to_chef" }
+    },
+    "serve_customer": {
+      "transitions": { "served": "check_satisfaction" }
+    },
+    "check_satisfaction": {
+      "transitions": { "satisfied": "express_gratitude", "needs_adjustment": "transmit_to_chef" }
+    },
+    "express_gratitude": {
+      "transitions": { "thanks_given": "return_to_idle" }
+    },
+    "return_to_idle": {
+      "transitions": { "complete": "__terminal__" }
+    }
+  }
+}

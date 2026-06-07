@@ -1,0 +1,1 @@
+{"test_id": "chef-schema-001", "assertions": [{"field": "order_id", "operator": "exists"}, {"field": "dish_name", "operator": "exists"}]}

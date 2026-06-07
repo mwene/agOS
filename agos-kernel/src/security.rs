@@ -154,6 +154,21 @@ impl SecurityEngine {
             rule: "blocked_actions".to_string(),
         });
         self.smt_solver.add_constraint(Constraint {
+            field: "action".to_string(),
+            operator: "in".to_string(),
+            value: serde_json::json!([
+                "hardware:arm:move",
+                "hardware:arm:grip",
+                "hardware:servo:rotate",
+                "hardware:sensor:read",
+                "hardware:gpio:write",
+                "hardware:pwm:set",
+                "hardware:estop:trigger",
+                "hardware:estop:clear",
+            ]),
+            rule: "hardware_safe_actions".to_string(),
+        });
+        self.smt_solver.add_constraint(Constraint {
             field: "capability".to_string(),
             operator: "!=".to_string(),
             value: serde_json::json!("admin:escalate"),

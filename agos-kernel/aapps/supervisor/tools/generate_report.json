@@ -1,0 +1,16 @@
+{
+  "name": "generate_shift_report",
+  "description": "Generate an end-of-shift summary report",
+  "input_schema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "total_customers_served": {"type": "integer"},
+      "total_orders": {"type": "integer"},
+      "complaints_resolved": {"type": "integer"},
+      "average_satisfaction": {"type": "number"},
+      "shift_duration_hours": {"type": "number"},
+      "date": {"type": "string"}
+    }
+  }
+}

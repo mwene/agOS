@@ -20,6 +20,11 @@ use crate::umi::UnifiedModelInterface;
 #[cfg(feature = "embodiment")]
 use crate::embodiment::EmbodimentLayer;
 
+#[cfg(feature = "uri")]
+use crate::controller::ControllerManager;
+#[cfg(feature = "uri")]
+use crate::uri::UnifiedRoboticsInterface;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanicLog {
     pub pid: String,
@@ -43,6 +48,10 @@ pub struct agOSKernel {
     pub orchestrator: SubAgentOrchestrator,
     #[cfg(feature = "embodiment")]
     pub embodiment: EmbodimentLayer,
+    #[cfg(feature = "uri")]
+    pub uri: UnifiedRoboticsInterface,
+    #[cfg(feature = "uri")]
+    pub controller: ControllerManager,
     panic_log: std::sync::RwLock<Vec<PanicLog>>,
 }
 
@@ -91,6 +100,10 @@ impl agOSKernel {
             orchestrator: SubAgentOrchestrator::new(),
             #[cfg(feature = "embodiment")]
             embodiment: EmbodimentLayer::new(),
+            #[cfg(feature = "uri")]
+            uri: UnifiedRoboticsInterface::new(),
+            #[cfg(feature = "uri")]
+            controller: ControllerManager::new(),
             panic_log: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -210,6 +223,11 @@ impl agOSKernel {
 
     pub fn hot_swap_umi(&self, driver_name: &str) -> Result<(), String> {
         self.umi.hot_swap(driver_name)
+    }
+
+    #[cfg(feature = "uri")]
+    pub fn hot_swap_uri(&self, driver_name: &str) -> Result<(), String> {
+        self.uri.hot_swap(driver_name)
     }
 
     pub async fn migrate_process(

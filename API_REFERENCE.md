@@ -21,6 +21,8 @@ All requests and responses use `Content-Type: application/json`.
 - [WASM Sandbox](#wasm-sandbox-feature-wasm-sandbox)
 - [Workflow Orchestration](#workflow-orchestration)
 - [Embodiment](#embodiment-feature-embodiment)
+- [URI — Unified Robotics Interface](#uri--unified-robotics-interface-feature-uri)
+- [Controller — Hardware Control Loops](#controller--hardware-control-loops-feature-uri)
 - [Grid — Decentralised Cognitive Grids](#grid--decentralised-cognitive-grids)
 
 ---
@@ -616,6 +618,318 @@ Response:
 Response:
 ```json
 {"apps": ["navigator", "manipulator"]}
+```
+
+---
+
+## URI — Unified Robotics Interface (feature `uri`)
+
+The URI provides hardware abstraction — read sensors, write actuators, apply data transforms, and manage hardware drivers.
+
+### `POST /uri/sense` — Read a sensor
+
+```json
+{"device_id": "temp_01", "driver_name": "SimulatedTemperature"}
+```
+
+`driver_name` is optional (uses active driver for device if omitted).
+
+Response:
+```json
+{"device_id": "temp_01", "value": 23.5, "unit": "celsius", "driver": "SimulatedTemperature", "timestamp": "..."}
+```
+
+### `POST /uri/actuate` — Write to an actuator
+
+```json
+{"device_id": "servo_01", "value": 90.0, "driver_name": "SimulatedServo"}
+```
+
+Response:
+```json
+{"ok": true, "device_id": "servo_01", "value": 90.0, "driver": "SimulatedServo"}
+```
+
+### `POST /uri/transform` — Apply a data transform
+
+```json
+{"name": "normalize_temp", "data": [0.0, 23.5, 100.0]}
+```
+
+Response:
+```json
+{"name": "normalize_temp", "result": [0.0, 0.235, 1.0]}
+```
+
+### `POST /uri/status` — Query driver/device status
+
+```json
+{"device_id": "temp_01"}
+```
+
+Response:
+```json
+{"device_id": "temp_01", "driver": "SimulatedTemperature", "driver_status": "Online", "last_read": "...", "last_value": 23.5}
+```
+
+### `POST /uri/switch` — Switch active driver for a device
+
+```json
+{"device_id": "temp_01", "driver_name": "SimulatedTemperature"}
+```
+
+Response:
+```json
+{"ok": true, "device_id": "temp_01", "active_driver": "SimulatedTemperature"}
+```
+
+### `GET /uri/metrics` — Driver usage metrics
+
+Response:
+```json
+{"metrics": [{"name": "SimulatedTemperature", "calls": 5, "errors": 0}, ...], "count": 4}
+```
+
+### `GET /uri/drivers` — List registered hardware drivers
+
+Response:
+```json
+{"count": 4, "drivers": [{"name": "SimulatedTemperature", "driver_type": "builtin", "capabilities": ["sensor:temperature"], "status": "Online"}, ...]}
+```
+
+### `GET /uri/drivers/{name}` — Get driver metadata
+
+Response:
+```json
+{"name": "SimulatedTemperature", "driver_type": "builtin", "capabilities": ["sensor:temperature"], "status": "Online", ...}
+```
+
+Error:
+```json
+{"error": "Driver 'Foo' not found"}
+```
+
+### `POST /uri/drivers/register` — Register a runtime hardware driver
+
+```json
+{
+  "name": "MyGPIO", "driver_type": "Runtime",
+  "capabilities": ["sensor:gpio", "actuator:gpio"],
+  "config": {"pin": 17, "mode": "input"}
+}
+```
+
+Response:
+```json
+{"ok": true, "name": "MyGPIO"}
+```
+
+### `POST /uri/drivers/unregister` — Unregister a runtime driver
+
+```json
+{"name": "MyGPIO"}
+```
+
+Response:
+```json
+{"ok": true}
+```
+
+Error:
+```json
+{"error": "Cannot unregister built-in driver 'SimulatedTemperature'"}
+```
+
+---
+
+## Controller — Hardware Control Loops (feature `uri`)
+
+Real-time control primitives: PID controllers, trajectory planning, safety monitors, emergency stop, coordinate transforms.
+
+### `POST /controller/pid` — Create a PID controller
+
+```json
+{
+  "id": "pid_arm_01", "kp": 1.5, "ki": 0.1, "kd": 0.05,
+  "setpoint": 90.0, "dt": 0.01,
+  "output_limits": [-100.0, 100.0]
+}
+```
+
+Response:
+```json
+{"ok": true, "id": "pid_arm_01"}
+```
+
+### `GET /controller/pid` — List PID controllers
+
+```json
+{"controllers": [{"id": "pid_arm_01", "kp": 1.5, "ki": 0.1, "kd": 0.05, "setpoint": 90.0, "output_limits": [-100.0, 100.0]}], "count": 1}
+```
+
+### `POST /controller/pid/setpoint` — Update PID setpoint
+
+```json
+{"id": "pid_arm_01", "setpoint": 45.0}
+```
+
+Response:
+```json
+{"ok": true, "id": "pid_arm_01", "setpoint": 45.0}
+```
+
+### `POST /controller/pid/step` — Execute one PID control step
+
+```json
+{"id": "pid_arm_01", "measurement": 30.0}
+```
+
+Response:
+```json
+{"id": "pid_arm_01", "output": 65.25, "error": 15.0, "p_term": 22.5, "i_term": 1.5, "d_term": 41.25}
+```
+
+### `POST /controller/trajectory` — Create a trajectory plan
+
+```json
+{
+  "id": "traj_pick_place", "interpolation": "Linear",
+  "waypoints": [
+    {"position": [0.0, 0.0, 0.0], "velocity": [0.0, 0.0, 0.0], "duration_secs": 1.0},
+    {"position": [1.0, 0.0, 0.5], "velocity": [0.1, 0.0, 0.0], "duration_secs": 2.0},
+    {"position": [1.0, 1.0, 0.5], "velocity": [0.0, 0.1, 0.0], "duration_secs": 2.0}
+  ]
+}
+```
+
+Response:
+```json
+{"ok": true, "id": "traj_pick_place"}
+```
+
+### `GET /controller/trajectory` — List trajectory plans
+
+Response:
+```json
+{"trajectories": [{"id": "traj_pick_place", "current_index": 0, "status": "Idle", "waypoints": 3}], "count": 1}
+```
+
+### `POST /controller/trajectory/start` — Start trajectory execution
+
+```json
+{"id": "traj_pick_place"}
+```
+
+Response:
+```json
+{"ok": true, "id": "traj_pick_place", "status": "Running", "waypoint_0": {"position": [0.0, 0.0, 0.0]}}
+```
+
+### `POST /controller/trajectory/step` — Advance trajectory one waypoint
+
+```json
+{"id": "traj_pick_place"}
+```
+
+Response:
+```json
+{"ok": true, "id": "traj_pick_place", "next_waypoint": {"position": [1.0, 0.0, 0.5]}, "index": 1, "remaining": 1}
+```
+
+### `POST /controller/safety` — Create a safety monitor
+
+```json
+{
+  "id": "safe_temp_01", "device_id": "temp_01",
+  "condition": "ThresholdAbove", "threshold": 80.0
+}
+```
+
+Supported conditions: `ThresholdAbove`, `ThresholdBelow`, `RateOfChange`, `Window`.
+
+Response:
+```json
+{"ok": true, "id": "safe_temp_01"}
+```
+
+### `POST /controller/safety/check` — Run safety check
+
+```json
+{"device_id": "temp_01", "value": 85.0}
+```
+
+Response (triggered):
+```json
+{"safe": false, "triggered": [{"id": "safe_temp_01", "condition": "ThresholdAbove", "threshold": 80.0, "value": 85.0}]}
+```
+
+Response (passed):
+```json
+{"safe": true, "triggered": []}
+```
+
+### `POST /controller/safety/estop` — Trigger emergency stop
+
+```json
+{"device_id": "temp_01", "reason": "Temperature critical"}
+```
+
+Response:
+```json
+{"ok": true, "event": {"id": "...", "device_id": "temp_01", "event_type": "ESTOP_TRIGGERED", "message": "Temperature critical", "cleared": false}}
+```
+
+### `POST /controller/safety/estop/clear` — Clear emergency stop
+
+```json
+{"device_id": "temp_01"}
+```
+
+Response:
+```json
+{"ok": true, "device_id": "temp_01", "cleared": true}
+```
+
+### `GET /controller/safety/monitors` — List safety monitors
+
+Response:
+```json
+{"monitors": [{"id": "safe_temp_01", "device_id": "temp_01", "condition": "ThresholdAbove", "threshold": 80.0, "triggered": false}], "count": 1}
+```
+
+### `GET /controller/safety/events/{device_id}` — Get safety events for a device
+
+Response:
+```json
+{"events": [{"id": "...", "device_id": "temp_01", "event_type": "ESTOP_TRIGGERED", "message": "Temperature critical", "timestamp": "...", "cleared": false}], "count": 1}
+```
+
+### `POST /controller/transform` — Add a coordinate transform
+
+```json
+{
+  "name": "base_to_world",
+  "matrix": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+```
+
+Response:
+```json
+{"ok": true, "name": "base_to_world"}
+```
+
+### `GET /controller/transform` — List coordinate transforms
+
+Response:
+```json
+{"transforms": [{"name": "base_to_world"}], "count": 1}
+```
+
+### `GET /controller/stats` — Controller statistics
+
+Response:
+```json
+{"stats": {"pid_count": 1, "trajectory_count": 1, "monitor_count": 1, "transform_count": 1, "total_events": 1, "active_estops": 1}}
 ```
 
 ---

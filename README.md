@@ -69,12 +69,14 @@ agos/
 │       ├── sandbox.rs             # .aapp loader + package manager
 │       ├── z3_solver.rs           # Z3 SMT solver (feature: z3-solver)
 │       ├── sandbox_wasm.rs        # WebAssembly sandbox (feature: wasm-sandbox)
+│       ├── uri.rs                 # Unified Robotics Interface (feature: uri)
+│       ├── controller.rs          # Control loops & safety monitors (feature: uri)
 │       ├── embodiment.rs          # Embodiment VLA pipeline (feature: embodiment)
 │       ├── grid.rs                # Decentralized Cognitive Grids
 │       ├── orchestrator.rs        # Sub-Agent Orchestration DSL runner
 │       ├── audit_export.rs        # Structured audit export (JSONL/CSV to stdout/file/S3)
 │       ├── telemetry.rs           # OpenTelemetry OTLP tracing init
-│       └── api.rs                 # axum REST API handlers (35+ endpoints)
+│       └── api.rs                 # axum REST API handlers (50+ endpoints)
 │
 ├── agos-sign/                     # .aapp signing CLI tool (ED25519)
 │   ├── Cargo.toml
@@ -153,6 +155,7 @@ Some endpoints require feature flags:
 | `z3-solver` | `--features z3-solver` | Enhances `/security/verify` with Z3 SMT |
 | `wasm-sandbox` | `--features wasm-sandbox` | `POST /sandbox/execute` |
 | `embodiment` | `--features embodiment` | 8 `/embodiment/*` endpoints |
+| `uri` | `--features uri` | 28 `/uri/*` and `/controller/*` endpoints |
 | `grid` | _always on_ | 7 `/grid/*` endpoints, no feature flag |
 | OpenTelemetry | _always on_ | No additional endpoints; adds `#[instrument]` spans |
 | Sub-Agent Orchestration | _always on_ | `POST /workflow/run`, `GET /workflow/status/:id` |
@@ -162,7 +165,7 @@ Some endpoints require feature flags:
 
 Run with all features:
 ```bash
-cargo run --features "z3-solver,wasm-sandbox,embodiment"
+cargo run --features "z3-solver,wasm-sandbox,embodiment,uri"
 ```
 
 ### Kernel
@@ -261,6 +264,43 @@ cargo run --features "z3-solver,wasm-sandbox,embodiment"
 | `POST` | `/grid/receive` | Accept migrated agent |
 | `POST` | `/grid/cipc/forward` | Forward cIPC message from another node |
 
+### URI — Unified Robotics Interface (feature `uri`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/uri/sense` | Read a sensor via a hardware driver |
+| `POST` | `/uri/actuate` | Write to an actuator via a hardware driver |
+| `POST` | `/uri/transform` | Apply a data transform pipeline |
+| `POST` | `/uri/status` | Query driver status |
+| `POST` | `/uri/switch` | Switch between hardware backends |
+| `GET` | `/uri/metrics` | Hardware driver metrics |
+| `GET` | `/uri/drivers` | List registered hardware drivers |
+| `GET` | `/uri/drivers/{name}` | Get driver metadata |
+| `POST` | `/uri/drivers/register` | Register a runtime hardware driver |
+| `POST` | `/uri/drivers/unregister` | Unregister a runtime hardware driver |
+
+### Controller — Hardware Control Loops (feature `uri`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/controller/pid` | Create a PID controller |
+| `GET` | `/controller/pid` | List PID controllers |
+| `POST` | `/controller/pid/setpoint` | Update PID setpoint |
+| `POST` | `/controller/pid/step` | Execute one PID control step |
+| `POST` | `/controller/trajectory` | Create a trajectory plan |
+| `GET` | `/controller/trajectory` | List trajectory plans |
+| `POST` | `/controller/trajectory/start` | Start trajectory execution |
+| `POST` | `/controller/trajectory/step` | Advance trajectory one waypoint |
+| `POST` | `/controller/safety` | Create a safety monitor |
+| `POST` | `/controller/safety/check` | Run safety check |
+| `POST` | `/controller/safety/estop` | Trigger emergency stop |
+| `POST` | `/controller/safety/estop/clear` | Clear emergency stop |
+| `GET` | `/controller/safety/monitors` | List safety monitors |
+| `GET` | `/controller/safety/events/{device_id}` | Get safety events for a device |
+| `POST` | `/controller/transform` | Add a coordinate transform |
+| `GET` | `/controller/transform` | List coordinate transforms |
+| `GET` | `/controller/stats` | Controller statistics |
+
 ---
 
 ## The `.aapp` Package Format
@@ -320,10 +360,12 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 - **Phase 8 ✓** — WebAssembly Sandbox (optional feature, wasmtime-based tool execution with fuel metering)
 - **Phase 9 ✓** — Embodiment Layer (VLA pipeline, multimodal goal processing, sub-agent orchestration, figure-of-speech detection, UMI-powered semantic resolution)
 - **Phase 10 ✓** — Decentralized Cognitive Grids (grid discovery, peer heartbeats, agent migration, remote cIPC forwarding)
+- **Phase 11 ✓** — Unified Robotics Interface + Hardware Control (URI abstraction, hardware drivers, PID control, trajectory planning, safety monitors, coordinate transforms)
 
 | Feature | Status |
 |---------|--------|
 | Phase 10 — Decentralized Cognitive Grids | ✓ Complete |
+| Phase 11 — Unified Robotics Interface + Hardware Control | ✓ Complete |
 | OpenTelemetry Instrumentation | ✓ Complete |
 | Kubernetes Operator | ✓ Complete |
 | Pluggable Scheduler Policies | ✓ Complete |
@@ -342,6 +384,7 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 |-------|----------|--------|
 | [`AGENT_DEV_GUIDE.md`](AGENT_DEV_GUIDE.md) | Agent developers | Building `.aapp` packages, state machines, tool schemas, deploying, cIPC, end-to-end walkthrough |
 | [`UMI_DRIVER_GUIDE.md`](UMI_DRIVER_GUIDE.md) | Model/driver developers | UMI architecture, `DriverState` struct, implementing syscalls, hot-swap mechanism, adding custom drivers |
+| [`URI_DRIVER_GUIDE.md`](URI_DRIVER_GUIDE.md) | Hardware/driver developers | URI architecture, `HardwareDriver` struct, built-in vs runtime drivers, GPIO walkthrough |
 | [`SYS_DEV_GUIDE.md`](SYS_DEV_GUIDE.md) | Kernel/system developers | Internal architecture, module deep-dives, concurrency model, adding subsystems & endpoints, build system, testing strategy |
 | [`FEATURES_GUIDE.md`](FEATURES_GUIDE.md) | All contributors | Implementation blueprints for Phases 6–10 and all planned enhancements, with file-level change plans, effort estimates, and prioritization |
 
@@ -427,6 +470,7 @@ See [SYS_DEV_GUIDE.md](SYS_DEV_GUIDE.md) for systemd service setup, VM provision
 | Area | Skill Needed | Complexity |
 |------|-------------|------------|
 | Embodiment VLA drivers (ROS2, robot arms) | Robotics, Rust | Hard |
+| URI hardware drivers (GPIO, I2C, SPI, CAN bus) | Embedded, Rust | Hard |
 | Decentralized Cognitive Grids | Distributed systems, Rust | Hard |
 | Additional UMI drivers (OpenAI, Anthropic, local GGUF) | Rust, API design | Medium |
 | `.aapp` marketplace API | Java, REST, Spring Boot | Medium |

@@ -1,0 +1,17 @@
+{
+  "initial_state": "monitor_operations",
+  "states": {
+    "monitor_operations": {
+      "transitions": { "all_well": "monitor_operations", "issue_detected": "resolve_issue", "shift_end": "report_shift_summary" }
+    },
+    "resolve_issue": {
+      "transitions": { "resolved": "quality_check", "escalated": "monitor_operations" }
+    },
+    "quality_check": {
+      "transitions": { "passed": "monitor_operations", "failed": "resolve_issue" }
+    },
+    "report_shift_summary": {
+      "transitions": { "reported": "__terminal__" }
+    }
+  }
+}

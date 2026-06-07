@@ -169,4 +169,100 @@ public class AgosKernelClient {
     public JsonNode listApps() {
         return client.get().uri("/sandbox/apps").retrieve().body(JsonNode.class);
     }
+
+    // ── URI (hardware abstraction) ────────────────────────
+    public JsonNode uriSense(String deviceId, String driverName) {
+        var body = mapper.createObjectNode().put("device_id", deviceId);
+        if (driverName != null) body.put("driver_name", driverName);
+        return client.post().uri("/uri/sense").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode uriActuate(String deviceId, double value, String driverName) {
+        var body = mapper.createObjectNode().put("device_id", deviceId).put("value", value);
+        if (driverName != null) body.put("driver_name", driverName);
+        return client.post().uri("/uri/actuate").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode uriTransform(String name, List<Double> data) {
+        var body = mapper.createObjectNode().put("name", name);
+        var arr = body.putArray("data");
+        data.forEach(arr::add);
+        return client.post().uri("/uri/transform").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode uriDrivers() {
+        return client.get().uri("/uri/drivers").retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode uriMetrics() {
+        return client.get().uri("/uri/metrics").retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode uriSwitch(String deviceId, String driverName) {
+        var body = mapper.createObjectNode()
+            .put("device_id", deviceId)
+            .put("driver_name", driverName);
+        return client.post().uri("/uri/switch").body(body).retrieve().body(JsonNode.class);
+    }
+
+    // ── Controller (PID, trajectory, safety) ──────────────
+    public JsonNode controllerCreatePID(String id, double kp, double ki, double kd, double setpoint, double dt, double min, double max) {
+        var body = mapper.createObjectNode();
+        body.put("id", id).put("kp", kp).put("ki", ki).put("kd", kd);
+        body.put("setpoint", setpoint).put("dt", dt);
+        var limits = body.putArray("output_limits");
+        limits.add(min).add(max);
+        return client.post().uri("/controller/pid").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerListPID() {
+        return client.get().uri("/controller/pid").retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerPIDStep(String id, double measurement) {
+        var body = mapper.createObjectNode().put("id", id).put("measurement", measurement);
+        return client.post().uri("/controller/pid/step").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerCreateTrajectory(String id, String interpolation, List<ObjectNode> waypoints) {
+        var body = mapper.createObjectNode().put("id", id).put("interpolation", interpolation);
+        var arr = body.putArray("waypoints");
+        waypoints.forEach(arr::add);
+        return client.post().uri("/controller/trajectory").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerStartTrajectory(String id) {
+        var body = mapper.createObjectNode().put("id", id);
+        return client.post().uri("/controller/trajectory/start").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerStepTrajectory(String id) {
+        var body = mapper.createObjectNode().put("id", id);
+        return client.post().uri("/controller/trajectory/step").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerCreateSafetyMonitor(String id, String deviceId, String condition, double threshold) {
+        var body = mapper.createObjectNode();
+        body.put("id", id).put("device_id", deviceId).put("condition", condition).put("threshold", threshold);
+        return client.post().uri("/controller/safety").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerSafetyCheck(String deviceId, double value) {
+        var body = mapper.createObjectNode().put("device_id", deviceId).put("value", value);
+        return client.post().uri("/controller/safety/check").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerEStop(String deviceId, String reason) {
+        var body = mapper.createObjectNode().put("device_id", deviceId).put("reason", reason);
+        return client.post().uri("/controller/safety/estop").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerClearEStop(String deviceId) {
+        var body = mapper.createObjectNode().put("device_id", deviceId);
+        return client.post().uri("/controller/safety/estop/clear").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode controllerStats() {
+        return client.get().uri("/controller/stats").retrieve().body(JsonNode.class);
+    }
 }

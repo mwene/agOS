@@ -101,6 +101,36 @@ pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
         .route("/embodiment/sensors", get(embodiment_sensors))
         .route("/embodiment/apps", get(embodiment_apps));
 
+    #[cfg(feature = "uri")]
+    let router = router
+        .route("/uri/sense", post(uri_sense))
+        .route("/uri/actuate", post(uri_actuate))
+        .route("/uri/transform", post(uri_transform))
+        .route("/uri/status", post(uri_status))
+        .route("/uri/switch", post(uri_switch))
+        .route("/uri/metrics", get(uri_metrics))
+        .route("/uri/drivers", get(uri_drivers))
+        .route("/uri/driver/:name", get(uri_driver))
+        .route("/uri/driver/register", post(uri_driver_register))
+        .route("/uri/driver/unregister", post(uri_driver_unregister))
+        .route("/controller/pid/create", post(controller_pid_create))
+        .route("/controller/pid/list", get(controller_pid_list))
+        .route("/controller/pid/setpoint", post(controller_pid_setpoint))
+        .route("/controller/pid/step", post(controller_pid_step))
+        .route("/controller/trajectory/create", post(controller_trajectory_create))
+        .route("/controller/trajectory/start", post(controller_trajectory_start))
+        .route("/controller/trajectory/step", post(controller_trajectory_step))
+        .route("/controller/trajectory/list", get(controller_trajectory_list))
+        .route("/controller/safety/create", post(controller_safety_create))
+        .route("/controller/safety/check", post(controller_safety_check))
+        .route("/controller/safety/estop", post(controller_safety_estop))
+        .route("/controller/safety/estop/clear", post(controller_safety_estop_clear))
+        .route("/controller/safety/monitors", get(controller_safety_monitors))
+        .route("/controller/safety/events/:device_id", get(controller_safety_events))
+        .route("/controller/transform/add", post(controller_transform_add))
+        .route("/controller/transform/list", get(controller_transform_list))
+        .route("/controller/stats", get(controller_stats));
+
     let router = router
         .route("/security/audit/export", post(security_audit_export))
         .route("/workflow/submit", post(workflow_submit))
@@ -906,6 +936,444 @@ async fn embodiment_sensors(State(kernel): State<KernelState>) -> Json<Value> {
 async fn embodiment_apps(State(kernel): State<KernelState>) -> Json<Value> {
     let apps = kernel.embodiment.list_agent_apps();
     Json(serde_json::json!({"apps": apps}))
+}
+
+// ── URI (Unified Robotics Interface) ─────────────────────────
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriSenseRequest {
+    sensor_id: String,
+}
+
+#[cfg(feature = "uri")]
+async fn uri_sense(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriSenseRequest>,
+) -> Json<Value> {
+    let result = kernel.uri.sense(&req.sensor_id);
+    Json(serde_json::json!({
+        "output": result.output,
+        "tokens_used": result.tokens_used,
+        "driver": result.driver,
+        "mode": result.mode,
+    }))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriActuateRequest {
+    actuator_id: String,
+    command: Value,
+}
+
+#[cfg(feature = "uri")]
+async fn uri_actuate(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriActuateRequest>,
+) -> Json<Value> {
+    let result = kernel.uri.actuate(&req.actuator_id, &req.command);
+    Json(serde_json::json!({
+        "output": result.output,
+        "tokens_used": result.tokens_used,
+        "driver": result.driver,
+        "mode": result.mode,
+    }))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriTransformRequest {
+    command: String,
+    args: Value,
+}
+
+#[cfg(feature = "uri")]
+async fn uri_transform(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriTransformRequest>,
+) -> Json<Value> {
+    let result = kernel.uri.transform(&req.command, &req.args);
+    Json(serde_json::json!({
+        "output": result.output,
+        "tokens_used": result.tokens_used,
+        "driver": result.driver,
+        "mode": result.mode,
+    }))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriStatusRequest {
+    device_id: String,
+}
+
+#[cfg(feature = "uri")]
+async fn uri_status(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriStatusRequest>,
+) -> Json<Value> {
+    let result = kernel.uri.status(&req.device_id);
+    Json(serde_json::json!({
+        "output": result.output,
+        "tokens_used": result.tokens_used,
+        "driver": result.driver,
+        "mode": result.mode,
+    }))
+}
+
+#[cfg(feature = "uri")]
+async fn uri_switch(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriSwitchRequest>,
+) -> Json<Value> {
+    match kernel.hot_swap_uri(&req.driver_name) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "active_driver": kernel.uri.active_name(),
+            "capability": kernel.uri.active_capability(),
+            "hardware_type": kernel.uri.active_hardware_type(),
+        })),
+        Err(e) => Json(serde_json::json!({"ok": false, "error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriSwitchRequest {
+    driver_name: String,
+}
+
+#[cfg(feature = "uri")]
+async fn uri_metrics(State(kernel): State<KernelState>) -> Json<Value> {
+    let metrics = kernel.uri.get_metrics();
+    Json(serde_json::json!({
+        "metrics": metrics,
+        "active_driver": kernel.uri.active_name(),
+    }))
+}
+
+#[cfg(feature = "uri")]
+async fn uri_drivers(State(kernel): State<KernelState>) -> Json<Value> {
+    let drivers = kernel.uri.list_drivers();
+    Json(serde_json::json!({ "drivers": drivers, "count": drivers.len() }))
+}
+
+#[cfg(feature = "uri")]
+async fn uri_driver(
+    State(kernel): State<KernelState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    match kernel.uri.get_driver(&name) {
+        Some(info) => Json(serde_json::json!(info)),
+        None => Json(serde_json::json!({"error": format!("Hardware driver '{}' not found", name)})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriRegisterDriverRequest {
+    name: String,
+    capability_level: u32,
+    #[serde(default = "uri_default_token_cost")]
+    token_cost: u64,
+    #[serde(default)]
+    hardware_type: String,
+    #[serde(default)]
+    config: HashMap<String, String>,
+}
+
+#[cfg(feature = "uri")]
+fn uri_default_token_cost() -> u64 { 1 }
+
+#[cfg(feature = "uri")]
+async fn uri_driver_register(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriRegisterDriverRequest>,
+) -> Json<Value> {
+    let hw_type = if req.hardware_type.is_empty() { "generic" } else { &req.hardware_type };
+    match kernel.uri.register_driver(
+        &req.name, req.capability_level, req.token_cost, hw_type, req.config,
+    ) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "name": req.name})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct UriUnregisterDriverRequest {
+    name: String,
+}
+
+#[cfg(feature = "uri")]
+async fn uri_driver_unregister(
+    State(kernel): State<KernelState>,
+    Json(req): Json<UriUnregisterDriverRequest>,
+) -> Json<Value> {
+    match kernel.uri.unregister_driver(&req.name) {
+        Ok(()) => Json(serde_json::json!({"ok": true})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+// ── Controller (Hardware Control Loops) ──────────────────────
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct CreatePidRequest {
+    joint: String,
+    kp: Option<f64>,
+    ki: Option<f64>,
+    kd: Option<f64>,
+    saturation_max: Option<f64>,
+    saturation_min: Option<f64>,
+    frequency_hz: Option<u64>,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_pid_create(
+    State(kernel): State<KernelState>,
+    Json(req): Json<CreatePidRequest>,
+) -> Json<Value> {
+    let gains = crate::controller::PIDGains {
+        kp: req.kp.unwrap_or(1.0),
+        ki: req.ki.unwrap_or(0.0),
+        kd: req.kd.unwrap_or(0.0),
+        saturation_max: req.saturation_max.unwrap_or(100.0),
+        saturation_min: req.saturation_min.unwrap_or(-100.0),
+    };
+    let ctrl = kernel.controller.create_pid_controller(&req.joint, gains, req.frequency_hz.unwrap_or(100));
+    Json(serde_json::json!({"controller": ctrl}))
+}
+
+#[cfg(feature = "uri")]
+async fn controller_pid_list(State(kernel): State<KernelState>) -> Json<Value> {
+    let controllers = kernel.controller.list_pid_controllers();
+    Json(serde_json::json!({"controllers": controllers, "count": controllers.len()}))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct PidSetpointRequest {
+    id: String,
+    setpoint: f64,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_pid_setpoint(
+    State(kernel): State<KernelState>,
+    Json(req): Json<PidSetpointRequest>,
+) -> Json<Value> {
+    match kernel.controller.set_pid_setpoint(&req.id, req.setpoint) {
+        Ok(()) => Json(serde_json::json!({"ok": true})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct PidStepRequest {
+    id: String,
+    measurement: f64,
+    dt: f64,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_pid_step(
+    State(kernel): State<KernelState>,
+    Json(req): Json<PidStepRequest>,
+) -> Json<Value> {
+    match kernel.controller.step_pid_controller(&req.id, req.measurement, req.dt) {
+        Ok(output) => Json(serde_json::json!({"output": output})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct TrajectoryCreateRequest {
+    joint_names: Vec<String>,
+    waypoints: Vec<crate::controller::Waypoint>,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_trajectory_create(
+    State(kernel): State<KernelState>,
+    Json(req): Json<TrajectoryCreateRequest>,
+) -> Json<Value> {
+    let traj = kernel.controller.create_trajectory(req.joint_names, req.waypoints);
+    Json(serde_json::json!({"trajectory": traj}))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct TrajectoryStartRequest {
+    id: String,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_trajectory_start(
+    State(kernel): State<KernelState>,
+    Json(req): Json<TrajectoryStartRequest>,
+) -> Json<Value> {
+    match kernel.controller.start_trajectory(&req.id) {
+        Ok(()) => Json(serde_json::json!({"ok": true})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct TrajectoryStepRequest {
+    id: String,
+    dt: f64,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_trajectory_step(
+    State(kernel): State<KernelState>,
+    Json(req): Json<TrajectoryStepRequest>,
+) -> Json<Value> {
+    match kernel.controller.step_trajectory(&req.id, req.dt) {
+        Ok(Some(positions)) => Json(serde_json::json!({"positions": positions, "done": false})),
+        Ok(None) => Json(serde_json::json!({"done": true})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+async fn controller_trajectory_list(State(kernel): State<KernelState>) -> Json<Value> {
+    let trajectories = kernel.controller.list_trajectories();
+    Json(serde_json::json!({"trajectories": trajectories, "count": trajectories.len()}))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct SafetyMonitorCreateRequest {
+    device_id: String,
+    position_min: Option<f64>,
+    position_max: Option<f64>,
+    velocity_max: Option<f64>,
+    torque_max: Option<f64>,
+    temperature_max: Option<f64>,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_safety_create(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SafetyMonitorCreateRequest>,
+) -> Json<Value> {
+    let limits = crate::controller::JointLimits {
+        joint_name: req.device_id.clone(),
+        position_min: req.position_min.unwrap_or(-180.0),
+        position_max: req.position_max.unwrap_or(180.0),
+        velocity_max: req.velocity_max.unwrap_or(180.0),
+        torque_max: req.torque_max.unwrap_or(100.0),
+        temperature_max: req.temperature_max.unwrap_or(85.0),
+    };
+    let monitor = kernel.controller.create_safety_monitor(&req.device_id, limits);
+    Json(serde_json::json!({"safety_monitor": monitor}))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct SafetyCheckRequest {
+    device_id: String,
+    position: f64,
+    velocity: f64,
+    torque: f64,
+    temperature: f64,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_safety_check(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SafetyCheckRequest>,
+) -> Json<Value> {
+    match kernel.controller.check_safety(&req.device_id, req.position, req.velocity, req.torque, req.temperature) {
+        Ok(()) => Json(serde_json::json!({"safe": true})),
+        Err(violations) => Json(serde_json::json!({"safe": false, "violations": violations})),
+    }
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct SafetyEStopRequest {
+    device_id: String,
+    reason: Option<String>,
+}
+
+#[cfg(feature = "uri")]
+async fn controller_safety_estop(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SafetyEStopRequest>,
+) -> Json<Value> {
+    match kernel.controller.trigger_e_stop(&req.device_id, &req.reason.unwrap_or_else(|| "manual".to_string())) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "estop_active": true})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+async fn controller_safety_estop_clear(
+    State(kernel): State<KernelState>,
+    Json(req): Json<SafetyEStopRequest>,
+) -> Json<Value> {
+    match kernel.controller.clear_e_stop(&req.device_id) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "estop_active": false})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[cfg(feature = "uri")]
+async fn controller_safety_monitors(State(kernel): State<KernelState>) -> Json<Value> {
+    let monitors = kernel.controller.list_safety_monitors();
+    Json(serde_json::json!({"safety_monitors": monitors, "count": monitors.len()}))
+}
+
+#[cfg(feature = "uri")]
+async fn controller_safety_events(
+    State(kernel): State<KernelState>,
+    Path(device_id): Path<String>,
+) -> Json<Value> {
+    let events = kernel.controller.list_safety_events(&device_id);
+    Json(serde_json::json!({"events": events, "count": events.len()}))
+}
+
+#[cfg(feature = "uri")]
+#[derive(Deserialize)]
+struct TransformAddRequest {
+    name: String,
+    parent: Option<String>,
+    translation: [f64; 3],
+    rotation: [f64; 4],
+}
+
+#[cfg(feature = "uri")]
+async fn controller_transform_add(
+    State(kernel): State<KernelState>,
+    Json(req): Json<TransformAddRequest>,
+) -> Json<Value> {
+    kernel.controller.add_transform_frame(
+        &req.name,
+        req.parent.as_deref(),
+        req.translation,
+        req.rotation,
+    );
+    Json(serde_json::json!({"ok": true, "frame": req.name}))
+}
+
+#[cfg(feature = "uri")]
+async fn controller_transform_list(State(kernel): State<KernelState>) -> Json<Value> {
+    let frames = kernel.controller.list_transform_frames();
+    Json(serde_json::json!({"frames": frames, "count": frames.len()}))
+}
+
+#[cfg(feature = "uri")]
+async fn controller_stats(State(kernel): State<KernelState>) -> Json<Value> {
+    let stats = kernel.controller.get_stats();
+    Json(serde_json::json!({"controller_stats": stats}))
 }
 
 // ── Security Audit Export ────────────────────────────────────

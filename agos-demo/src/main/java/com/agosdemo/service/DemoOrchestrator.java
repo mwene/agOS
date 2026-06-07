@@ -260,5 +260,163 @@ public class DemoOrchestrator {
             var procs = kernel.listProcesses();
             if (!procs.has("processes")) throw new RuntimeException("No process list");
         });
+
+        // P9: Robotic Agent Demo (Waiter + Chef + Supervisor)
+        runStep("P9", "Install 'Waiter' robotic .aapp bundle", () -> {
+            var r = kernel.installApp("waiter");
+            if (!"installed".equals(r.path("status").asText()))
+                throw new RuntimeException("Install waiter failed: " + r);
+        });
+
+        runStep("P9", "Install 'Chef' robotic .aapp bundle", () -> {
+            var r = kernel.installApp("chef");
+            if (!"installed".equals(r.path("status").asText()))
+                throw new RuntimeException("Install chef failed: " + r);
+        });
+
+        runStep("P9", "Install 'Supervisor' robotic .aapp bundle", () -> {
+            var r = kernel.installApp("supervisor");
+            if (!"installed".equals(r.path("status").asText()))
+                throw new RuntimeException("Install supervisor failed: " + r);
+        });
+
+        var pidWaiter = new AtomicReference<String>();
+        var pidChef = new AtomicReference<String>();
+        var pidSupervisor = new AtomicReference<String>();
+
+        runStep("P9", "Spawn Waiter process (priority 2, restaurant service)", () -> {
+            var manifest = mapper.createObjectNode();
+            manifest.put("priority", 2);
+            manifest.putObject("limits").put("max_tokens", 5000);
+            var perms = manifest.putArray("permissions");
+            perms.add("cipc:communicate").add("memory:page");
+            manifest.put("goal_metric", 0.95);
+            var r = kernel.spawnProcess(manifest, null);
+            var pid = r.path("pid").asText();
+            if (pid.isEmpty()) throw new RuntimeException("Waiter spawn returned no PID");
+            pidWaiter.set(pid);
+        });
+
+        runStep("P9", "Spawn Chef process (priority 2, kitchen preparation)", () -> {
+            var manifest = mapper.createObjectNode();
+            manifest.put("priority", 2);
+            manifest.putObject("limits").put("max_tokens", 3000);
+            var perms = manifest.putArray("permissions");
+            perms.add("cipc:communicate").add("memory:page");
+            manifest.put("goal_metric", 0.98);
+            var r = kernel.spawnProcess(manifest, pidWaiter.get());
+            var pid = r.path("pid").asText();
+            if (pid.isEmpty()) throw new RuntimeException("Chef spawn returned no PID");
+            pidChef.set(pid);
+        });
+
+        runStep("P9", "Spawn Supervisor process (priority 3, quality oversight)", () -> {
+            var manifest = mapper.createObjectNode();
+            manifest.put("priority", 3);
+            manifest.putObject("limits").put("max_tokens", 4000);
+            var perms = manifest.putArray("permissions");
+            perms.add("cipc:communicate").add("memory:page").add("scheduler:spawn");
+            manifest.put("goal_metric", 0.99);
+            var r = kernel.spawnProcess(manifest, null);
+            var pid = r.path("pid").asText();
+            if (pid.isEmpty()) throw new RuntimeException("Supervisor spawn returned no PID");
+            pidSupervisor.set(pid);
+        });
+
+        runStep("P9", "Verify all 3 robotic agents running", () -> {
+            var procs = kernel.listProcesses();
+            int count = procs.path("processes").size();
+            if (count < 5) throw new RuntimeException("Expected >=5 processes, got " + count);
+        });
+
+        runStep("P9", "Waiter senses customer arrival via URI sensor", () -> {
+            var r = kernel.uriSense("customer_sensor", null);
+            if (!r.has("output")) throw new RuntimeException("URI sense failed: " + r);
+        });
+
+        runStep("P9", "Waiter transmits order to Chef via cIPC", () -> {
+            var payload = mapper.createObjectNode();
+            payload.put("type", "restaurant.order");
+            payload.put("customer_id", "cust-001");
+            payload.put("table", 5);
+            var items = payload.putArray("items");
+            items.add("Pasta Carbonara").add("Tiramisu");
+            payload.put("order_id", "ord-" + System.currentTimeMillis());
+            var r = kernel.routeMessage(pidWaiter.get(), pidChef.get(), payload);
+            if (!r.path("ok").asBoolean())
+                throw new RuntimeException("cIPC transmit order failed");
+        });
+
+        runStep("P9", "Waiter actuates arm to serve via URI actuator", () -> {
+            var r = kernel.uriActuate("servo_arm", 90.0, null);
+            if (!r.has("output")) throw new RuntimeException("URI actuate failed: " + r);
+        });
+
+        runStep("P9", "URI hardware driver metrics collected", () -> {
+            var metrics = kernel.uriMetrics();
+            if (!metrics.has("metrics")) throw new RuntimeException("No URI metrics");
+        });
+
+        runStep("P9", "Controller PID — create arm position PID loop", () -> {
+            var r = kernel.controllerCreatePID("pid_arm_01", 1.5, 0.1, 0.05, 90.0, 0.01, -180.0, 180.0);
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("PID create failed");
+        });
+
+        runStep("P9", "Controller PID — step control loop", () -> {
+            var r = kernel.controllerPIDStep("pid_arm_01", 45.0);
+            if (!r.has("output")) throw new RuntimeException("PID step failed");
+        });
+
+        runStep("P9", "Controller trajectory — create pick-and-place plan", () -> {
+            var wp1 = mapper.createObjectNode();
+            wp1.putArray("position").add(0.0).add(0.0).add(0.0);
+            wp1.putArray("velocity").add(0.0).add(0.0).add(0.0);
+            wp1.put("duration_secs", 1.0);
+            var wp2 = mapper.createObjectNode();
+            wp2.putArray("position").add(1.0).add(0.0).add(0.5);
+            wp2.putArray("velocity").add(0.1).add(0.0).add(0.0);
+            wp2.put("duration_secs", 2.0);
+            var r = kernel.controllerCreateTrajectory("traj_serve", "Linear", List.of(wp1, wp2));
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("Trajectory create failed");
+        });
+
+        runStep("P9", "Controller trajectory — start execution", () -> {
+            var r = kernel.controllerStartTrajectory("traj_serve");
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("Trajectory start failed");
+        });
+
+        runStep("P9", "Controller safety — create temperature monitor", () -> {
+            var r = kernel.controllerCreateSafetyMonitor("safe_oven_01", "oven_01", "ThresholdAbove", 250.0);
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("Safety monitor create failed");
+        });
+
+        runStep("P9", "Controller safety — check temperature (safe)", () -> {
+            var r = kernel.controllerSafetyCheck("oven_01", 180.0);
+            if (!r.path("safe").asBoolean()) throw new RuntimeException("Safety check should pass: " + r);
+        });
+
+        runStep("P9", "Controller safety — trigger emergency stop", () -> {
+            var r = kernel.controllerEStop("oven_01", "Temperature spike detected");
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("E-Stop failed");
+        });
+
+        runStep("P9", "Controller safety — clear emergency stop", () -> {
+            var r = kernel.controllerClearEStop("oven_01");
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("E-Stop clear failed");
+        });
+
+        runStep("P9", "Controller statistics collected", () -> {
+            var r = kernel.controllerStats();
+            if (!r.has("stats")) throw new RuntimeException("Controller stats missing");
+        });
+
+        runStep("P9", "Robotic agent apps listed", () -> {
+            var apps = kernel.listApps();
+            var names = new java.util.HashSet<String>();
+            apps.path("apps").forEach(n -> names.add(n.asText()));
+            if (!names.contains("waiter")) throw new RuntimeException("waiter not in app list");
+            if (!names.contains("chef")) throw new RuntimeException("chef not in app list");
+            if (!names.contains("supervisor")) throw new RuntimeException("supervisor not in app list");
+        });
     }
 }

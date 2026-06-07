@@ -1,0 +1,15 @@
+{
+  "name": "resolve_customer_complaint",
+  "description": "Handle and resolve a customer complaint or service issue",
+  "input_schema": {
+    "type": "object",
+    "required": ["complaint_id", "customer_id", "description"],
+    "properties": {
+      "complaint_id": {"type": "string"},
+      "customer_id": {"type": "string"},
+      "description": {"type": "string"},
+      "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+      "resolution": {"type": "string"}
+    }
+  }
+}

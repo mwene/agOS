@@ -1,6 +1,6 @@
 # Features Guide
 
-This guide documents all 10 phases of the agOS development roadmap — **Phases 1–5 (completed)** and **Phases 6–10 (planned)** — plus additional enhancements beyond the core roadmap. Each entry includes the motivation, design overview, implementation steps, files to modify, testing strategy, and open questions. Use this as a blueprint when picking up the next phase of work.
+This guide documents all 11 phases of the agOS development roadmap — **Phases 1–5 (completed)** and **Phases 6–11 (completed)** — plus additional enhancements beyond the core roadmap. Each entry includes the motivation, design overview, implementation steps, files to modify, testing strategy, and open questions. Use this as a blueprint when picking up the next phase of work.
 
 ---
 
@@ -16,6 +16,7 @@ This guide documents all 10 phases of the agOS development roadmap — **Phases 
 - [Phase 8 — WebAssembly Sandbox (Completed)](#phase-8--webassembly-sandbox)
 - [Phase 9 — Embodiment Layer (VLA Driver Pipeline) (Completed)](#phase-9--embodiment-layer-vla-driver-pipeline)
 - [Phase 10 — Decentralized Cognitive Grids (Completed)](#phase-10--decentralized-cognitive-grids)
+- [Phase 11 — Unified Robotics Interface + Hardware Control (Completed)](#phase-11--unified-robotics-interface--hardware-control)
 - [Additional Enhancements](#additional-enhancements)
   - [Persistent Storage (SQLite)](#persistent-storage-sqlite)
   - [Rate Limiting and QoS](#rate-limiting-and-qos)
@@ -748,6 +749,150 @@ cargo test --features "z3-solver,wasm-sandbox,embodiment"
 
 ---
 
+## Phase 11 — Unified Robotics Interface + Hardware Control (Completed)
+
+### Motivation
+
+agOS must bridge the gap between cognitive reasoning and physical hardware. Just as UMI abstracts AI models through four syscalls, the **Unified Robotics Interface (URI)** abstracts hardware sensors and actuators through a uniform interface. The **Controller** module provides real-time control primitives — PID loops, trajectory planning, safety monitors, and coordinate transforms — needed for robotics, automation, and IoT use cases.
+
+### What Was Built
+
+**`uri.rs` — UnifiedRoboticsInterface** (`src/uri.rs`):
+- **Hardware driver registry** — builtin (compile-time) and runtime (dynamic) drivers, each declaring capabilities (e.g., `sensor:temperature`, `actuator:servo`).
+- **Device state tracking** — per-device last value, timestamp, unit, and active driver mapping.
+- **Data transforms** — composable pipelines of `Normalize`, `Scale`, `Threshold`, `MovingAverage`, and `Custom` steps.
+- **4 built-in drivers**: `SimulatedTemperature`, `SimulatedServo`, `SimulatedDistance`, `SimulatedIMU`.
+- **10 REST endpoints** under `/uri/*`.
+
+**`controller.rs` — ControllerManager** (`src/controller.rs`):
+- **PID controllers** — configurable gains (Kp, Ki, Kd), setpoint, integral windup, output clamping, per-step computation.
+- **Trajectory planning** — waypoint-based plans with linear interpolation, current-index tracking, start/step execution model.
+- **Safety monitors** — four condition types (`ThresholdAbove`, `ThresholdBelow`, `RateOfChange`, `Window`) with threshold checks, triggered state tracking.
+- **Emergency stop** — device-scoped estop with log and clear operations.
+- **Coordinate transforms** — named 4×4 matrix transforms for robot kinematics.
+- **Safety event log** — append-only event store with clearable ESTOP events.
+- **17 REST endpoints** under `/controller/*`.
+
+### Design
+
+```
+URI (Unified Robotics Interface):
+  ┌─────────────────────┐
+  │  Hardware Drivers    │  ← builtin (static) + runtime (dynamic)
+  │  s                   │
+  │  s                   │
+  │     SimTemp ──► sensor:temperature
+  │     SimServo ──► actuator:servo
+  │     SimDist  ──► sensor:distance
+  │     SimIMU   ──► sensor:imu
+  └─────────┬───────────┘
+            │ sense() / actuate()
+            ▼
+  ┌─────────────────────┐
+  │   Device Registry   │  ← device_id → (driver, last_value, unit)
+  └─────────┬───────────┘
+            │
+  ┌─────────▼───────────┐
+  │  Data Transforms    │  ← Normalize → Scale → Threshold → MA
+  └─────────────────────┘
+
+Controller (Hardware Control Loops):
+  ┌─────────────────────┐
+  │   PID Controllers   │  ← Kp, Ki, Kd, setpoint, step()
+  ├─────────────────────┤
+  │  Trajectory Plans   │  ← waypoints, interpolation, start/step
+  ├─────────────────────┤
+  │  Safety Monitors    │  ← ThresholdAbove/Below, RateOfChange, Window
+  ├─────────────────────┤
+  │  Emergency Stop     │  ← per-device estop + clear
+  ├─────────────────────┤
+  │  Coord Transforms   │  ← 4×4 matrices, named registry
+  ├─────────────────────┤
+  │  Safety Event Log   │  ← append-only, clearable
+  └─────────────────────┘
+```
+
+### REST Endpoints
+
+**URI** (10 endpoints):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/uri/sense` | Read sensor value via driver |
+| POST | `/uri/actuate` | Write actuator value via driver |
+| POST | `/uri/transform` | Apply a data transform pipeline |
+| POST | `/uri/status` | Query driver/device status |
+| POST | `/uri/switch` | Switch active driver for a device |
+| GET | `/uri/metrics` | Per-driver call/error metrics |
+| GET | `/uri/drivers` | List registered drivers |
+| GET | `/uri/drivers/{name}` | Get driver metadata |
+| POST | `/uri/drivers/register` | Register runtime hardware driver |
+| POST | `/uri/drivers/unregister` | Unregister runtime hardware driver |
+
+**Controller** (17 endpoints):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/controller/pid` | Create PID controller |
+| GET | `/controller/pid` | List PID controllers |
+| POST | `/controller/pid/setpoint` | Update PID setpoint |
+| POST | `/controller/pid/step` | Execute one PID control step |
+| POST | `/controller/trajectory` | Create trajectory plan |
+| GET | `/controller/trajectory` | List trajectory plans |
+| POST | `/controller/trajectory/start` | Start trajectory execution |
+| POST | `/controller/trajectory/step` | Advance trajectory one waypoint |
+| POST | `/controller/safety` | Create safety monitor |
+| POST | `/controller/safety/check` | Run safety check on a device |
+| POST | `/controller/safety/estop` | Trigger emergency stop |
+| POST | `/controller/safety/estop/clear` | Clear emergency stop |
+| GET | `/controller/safety/monitors` | List safety monitors |
+| GET | `/controller/safety/events/{device_id}` | Get safety events for a device |
+| POST | `/controller/transform` | Add coordinate transform |
+| GET | `/controller/transform` | List coordinate transforms |
+| GET | `/controller/stats` | Controller statistics |
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/uri.rs` | `UnifiedRoboticsInterface`, `HardwareDriver`, `DeviceState`, `DataTransform` |
+| `agos-kernel/src/controller.rs` | `ControllerManager`, `PIDController`, `TrajectoryPlan`, `SafetyMonitor`, `SafetyEvent` |
+| `agos-kernel/src/lib.rs` | `pub mod uri`, `pub mod controller` behind `uri` feature |
+| `agos-kernel/src/kernel.rs` | `pub uri`, `pub controller` fields behind `#[cfg(feature = "uri")]` |
+| `agos-kernel/src/api.rs` | 10 `/uri/*` + 17 `/controller/*` routes behind cfg gate |
+| `agos-kernel/Cargo.toml` | `uri = []` feature flag |
+
+### Testing
+
+```bash
+# With feature flag:
+cargo test --features uri
+
+# All features:
+cargo test --features "z3-solver,wasm-sandbox,embodiment,uri"
+# 56 tests total
+```
+
+### Key Design Decisions
+
+- **Single feature flag (`uri`)** — both URI and Controller share the same feature, since controller depends on URI concepts (device IDs, drivers).
+- **Sync methods** — both URI and Controller methods are synchronous (no async). Hardware operations are expected to be fast (register reads, actuator writes). Async can be added per-driver if needed.
+- **`std::sync::RwLock` for URI** — concurrent reads for sense/status/metrics are common; writes (register/unregister/switch) are rare.
+- **`std::sync::Mutex` for Controller** — reads and writes are both infrequent and short; a single Mutex avoids the complexity of RwLock while being sufficient for demo-scale loads.
+- **Built-in simulated drivers** — 4 built-in drivers provide realistic test data (temperature, servo angle, distance, IMU orientation) without external hardware.
+- **Runtime driver registration** — third-party hardware drivers can be registered dynamically (e.g., GPIO via sysfs, I2C, SPI) without recompiling the kernel.
+- **Safety loop is app-driven** — the kernel does not run a background safety monitor. Apps call `/controller/safety/check` before critical operations. A background daemon can be added later.
+- **Event log is append-only** — ESTOP events are never deleted, only marked `cleared: true`. This provides an audit trail for safety incidents.
+
+### Open Questions
+
+- Should there be a background safety daemon that polls monitored devices on a timer?
+- Should the kernel support hot-plug detection for hardware devices?
+- How to handle driver-to-device mapping when multiple drivers support the same capability?
+- Should coordinate transforms support composition (multiply two transforms, invert)?
+
+---
+
 ## Additional Enhancements
 
 ### Persistent Storage (SQLite)
@@ -1056,6 +1201,7 @@ AGOS_TRUSTED_KEY=$(cat public.pem) cargo run -p agos-kernel
 | Kubernetes Operator | 3 days | Medium — cloud deployment | Dockerfile | ✓ Implemented |
 | **Phase 9**: Embodiment Layer | 3 weeks | High — robotics use cases | UMI, WASM sandbox | ✓ Complete |
 | **Phase 10**: Decentralized Grids | 4 weeks | High — scale-out architecture | Persistent Storage | ✓ Complete |
+| **Phase 11**: URI + Hardware Control | 2 weeks | High — hardware abstraction | None | ✓ Complete |
 
 ---
 

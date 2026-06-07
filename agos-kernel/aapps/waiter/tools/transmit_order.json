@@ -1,0 +1,14 @@
+{
+  "name": "transmit_order_to_chef",
+  "description": "Send the customer's order to the chef via cIPC",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id", "order_id", "items"],
+    "properties": {
+      "customer_id": {"type": "string"},
+      "order_id": {"type": "string"},
+      "items": {"type": "array", "items": {"type": "string"}},
+      "table_number": {"type": "integer"}
+    }
+  }
+}

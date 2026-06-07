@@ -1,0 +1,14 @@
+{
+  "name": "monitor_service_quality",
+  "description": "Monitor overall restaurant service quality metrics",
+  "input_schema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "active_orders": {"type": "integer"},
+      "pending_orders": {"type": "integer"},
+      "average_wait_time_minutes": {"type": "number"},
+      "customer_satisfaction_score": {"type": "number", "minimum": 0, "maximum": 10}
+    }
+  }
+}

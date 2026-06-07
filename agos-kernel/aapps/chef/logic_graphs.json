@@ -1,0 +1,14 @@
+{
+  "initial_state": "receive_order",
+  "states": {
+    "receive_order": {
+      "transitions": { "order_received": "prepare_order", "order_rejected": "receive_order" }
+    },
+    "prepare_order": {
+      "transitions": { "prepared": "hand_to_waiter", "out_of_stock": "receive_order" }
+    },
+    "hand_to_waiter": {
+      "transitions": { "handed_off": "__terminal__" }
+    }
+  }
+}

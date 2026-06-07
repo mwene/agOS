@@ -1,0 +1,9 @@
+{
+  "name": "Waiter",
+  "version": "1.0.0",
+  "description": "Robotic restaurant waiter — greet customers, take orders, serve, and express gratitude",
+  "permissions": ["cipc:communicate", "memory:page", "scheduler:spawn"],
+  "limits": { "max_tokens": 5000, "max_subagents": 3 },
+  "priority": 2,
+  "goal_metric": 0.95
+}

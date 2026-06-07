@@ -9,6 +9,7 @@ default = []
 z3-solver = ["dep:z3"]
 wasm-sandbox = ["dep:wasmtime"]
 embodiment = []
+uri = []
 
 [dependencies]
 axum = "0.7"

@@ -1,0 +1,14 @@
+{
+  "name": "notify_waiter_order_ready",
+  "description": "Signal the waiter that an order is ready for pickup",
+  "input_schema": {
+    "type": "object",
+    "required": ["order_id", "waiter_pid"],
+    "properties": {
+      "order_id": {"type": "string"},
+      "waiter_pid": {"type": "string", "description": "PID of the waiter agent to notify"},
+      "items": {"type": "array", "items": {"type": "string"}},
+      "preparation_time_secs": {"type": "number"}
+    }
+  }
+}
