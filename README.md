@@ -22,6 +22,10 @@
 |  | (System 2 / Token Allocation)  |  |  (Context Window Paging)    |  |
 |  +--------------------------------+  +-----------------------------+  |
 |  +--------------------------------+  +-----------------------------+  |
+|  |     MARKETPLACE & GOVERNANCE   |  |   SUB-AGENT ORCHESTRATOR    |  |
+|  | (Agent Catalog / Contracts)    |  | (Workflow DSL / Loop Exec)  |  |
+|  +--------------------------------+  +-----------------------------+  |
+|  +--------------------------------+  +-----------------------------+  |
 |  |     TOOL & cIPC ROUTER         |  | NEURO-SYMBOLIC GUARDRAILS   |  |
 |  |   (Virtualized Sandboxes)      |  | (Formal SMT Verification)   |  |
 |  +--------------------------------+  +-----------------------------+  |
@@ -73,10 +77,12 @@ agos/
 │       ├── controller.rs          # Control loops & safety monitors (feature: uri)
 │       ├── embodiment.rs          # Embodiment VLA pipeline (feature: embodiment)
 │       ├── grid.rs                # Decentralized Cognitive Grids
-│       ├── orchestrator.rs        # Sub-Agent Orchestration DSL runner
+│       ├── orchestrator.rs        # Sub-Agent Orchestration DSL runner (loops, parallel steps)
+│       ├── marketplace.rs         # Agent Marketplace: catalog, search, templates, build, recommend
+│       ├── governance.rs          # Governance Engine: contracts, compliance, policies, audit
 │       ├── audit_export.rs        # Structured audit export (JSONL/CSV to stdout/file/S3)
 │       ├── telemetry.rs           # OpenTelemetry OTLP tracing init
-│       └── api.rs                 # axum REST API handlers (50+ endpoints)
+│       └── api.rs                 # axum REST API handlers (60+ endpoints)
 │
 ├── agos-sign/                     # .aapp signing CLI tool (ED25519)
 │   ├── Cargo.toml
@@ -158,8 +164,10 @@ Some endpoints require feature flags:
 | `uri` | `--features uri` | 28 `/uri/*` and `/controller/*` endpoints |
 | `grid` | _always on_ | 7 `/grid/*` endpoints, no feature flag |
 | OpenTelemetry | _always on_ | No additional endpoints; adds `#[instrument]` spans |
-| Sub-Agent Orchestration | _always on_ | `POST /workflow/run`, `GET /workflow/status/:id` |
+| Sub-Agent Orchestration | _always on_ | `POST /workflow/submit`, `POST /workflow/execute`, `GET /workflow/list`, `GET /workflow/:id` |
 | Structured Audit Export | _always on_ | `POST /security/audit/export` |
+| Marketplace | _always on_ | 7 `/marketplace/*` endpoints (list, search, get, scan, templates, build, recommend) |
+| Governance | _always on_ | 7 `/governance/*` endpoints (contract CRUD, compliance, audit, policies) |
 | Scheduler Policies | _always on_ | `GET /scheduler/policy`, `POST /scheduler/policy` |
 | `.aapp` Signing | _always on_ | No additional endpoints; `AGOS_TRUSTED_KEY` env var |
 
@@ -236,8 +244,35 @@ cargo run --features "z3-solver,wasm-sandbox,embodiment,uri"
 
 | Method | Path | Feature | Description |
 |--------|------|---------|-------------|
-| `POST` | `/workflow/run` | — | Run a sub-agent workflow from a .aapp package |
-| `GET` | `/workflow/status/{id}` | — | Get workflow execution status |
+| `POST` | `/workflow/submit` | — | Submit a workflow definition (without executing) |
+| `POST` | `/workflow/execute` | — | Execute a submitted workflow by ID |
+| `GET` | `/workflow/list` | — | List all workflow instances |
+| `GET` | `/workflow/{id}` | — | Get workflow instance details (status, current step, results) |
+
+### Marketplace
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/marketplace/list` | List all agents in the marketplace catalog |
+| `POST` | `/marketplace/search` | Search agents by query, capability, priority, or workflow flag |
+| `GET` | `/marketplace/agent/{name}` | Get a single agent listing by name |
+| `POST` | `/marketplace/scan` | Scan local `aapps/` directory and refresh catalog |
+| `GET` | `/marketplace/templates` | List built-in agent templates (data_analyzer, report_generator, validator) |
+| `POST` | `/marketplace/build` | Build a new `.aapp` agent from a template or custom spec |
+| `POST` | `/marketplace/recommend` | Recommend a goal→workflow using UMI reasoning |
+
+### Governance
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/governance/contract/create` | Create a governance contract with rules, limits, and success criteria |
+| `GET` | `/governance/contract/{id}` | Get a governance contract by ID |
+| `GET` | `/governance/contracts` | List all governance contracts |
+| `POST` | `/governance/contract/{id}/remove` | Remove a governance contract |
+| `GET` | `/governance/compliance` | Get compliance summary (total checks, violations, top violators) |
+| `GET` | `/governance/audit` | Get compliance audit log |
+| `POST` | `/governance/policy/create` | Create a policy bundling multiple contracts |
+| `GET` | `/governance/policies` | List all governance policies |
 
 ### Embodiment
 
@@ -332,7 +367,7 @@ Example `manifest.json`:
 
 ## Demo Scenario: Financial Auditor + Accountant
 
-The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 phases:
+The demo walks through all core agOS capabilities in steps across 13 phases:
 
 | Phase | Steps | What It Shows |
 |-------|-------|---------------|
@@ -345,6 +380,10 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 | **P6** | 4 | Ring 0 ALLOW/DENY, SMT constraint enforcement, kernel panic, L1 flush |
 | **P7** | 2 | Episodic ledger audit trail, Ring 0 audit log |
 | **P8** | 3 | Memory stats, UMI metrics, process listing |
+| **P9** | 17 | Robotic agents (Waiter/Chef/Supervisor), URI sensors, actuators, PID loops, trajectory planning, safety monitors, E-Stop |
+| **P10** | 4 | Workflow orchestration with RepeatUntil loop step and 3-agent DAG |
+| **P11** | — | Marketplace: agent catalog, search, templates, build, goal→workflow recommendation |
+| **P12** | — | Governance: contracts, compliance checking, policies, audit log |
 
 ---
 
@@ -361,15 +400,19 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 - **Phase 9 ✓** — Embodiment Layer (VLA pipeline, multimodal goal processing, sub-agent orchestration, figure-of-speech detection, UMI-powered semantic resolution)
 - **Phase 10 ✓** — Decentralized Cognitive Grids (grid discovery, peer heartbeats, agent migration, remote cIPC forwarding)
 - **Phase 11 ✓** — Unified Robotics Interface + Hardware Control (URI abstraction, hardware drivers, PID control, trajectory planning, safety monitors, coordinate transforms)
+- **Phase 12 ✓** — Agent Marketplace (agent catalog, search, scan, built-in templates, agent building, goal→workflow recommendation via UMI)
+- **Phase 13 ✓** — Governance Engine (governance contracts with rules/limits/criteria, compliance checking, policies, audit logging)
 
 | Feature | Status |
 |---------|--------|
 | Phase 10 — Decentralized Cognitive Grids | ✓ Complete |
 | Phase 11 — Unified Robotics Interface + Hardware Control | ✓ Complete |
+| Phase 12 — Agent Marketplace | ✓ Complete |
+| Phase 13 — Governance Engine | ✓ Complete |
 | OpenTelemetry Instrumentation | ✓ Complete |
 | Kubernetes Operator | ✓ Complete |
 | Pluggable Scheduler Policies | ✓ Complete |
-| Sub-Agent Orchestration DSL | ✓ Complete |
+| Sub-Agent Orchestration DSL (loops, parallel, submit/execute API) | ✓ Complete |
 | Secure .aapp Signing | ✓ Complete |
 | Structured Audit Export | ✓ Complete |
 | Persistent Storage (SQLite) | Planned |
@@ -382,11 +425,11 @@ The pre-seed demo walks through all core agOS capabilities in 28 steps across 8 
 
 | Guide | Audience | Covers |
 |-------|----------|--------|
-| [`AGENT_DEV_GUIDE.md`](AGENT_DEV_GUIDE.md) | Agent developers | Building `.aapp` packages, state machines, tool schemas, deploying, cIPC, end-to-end walkthrough |
+| [`AGENT_DEV_GUIDE.md`](AGENT_DEV_GUIDE.md) | Agent developers | Building `.aapp` packages, state machines, tool schemas, deploying, cIPC, agent building from templates, goal→workflow recommendation |
 | [`UMI_DRIVER_GUIDE.md`](UMI_DRIVER_GUIDE.md) | Model/driver developers | UMI architecture, `DriverState` struct, implementing syscalls, hot-swap mechanism, adding custom drivers |
 | [`URI_DRIVER_GUIDE.md`](URI_DRIVER_GUIDE.md) | Hardware/driver developers | URI architecture, `HardwareDriver` struct, built-in vs runtime drivers, GPIO walkthrough |
-| [`SYS_DEV_GUIDE.md`](SYS_DEV_GUIDE.md) | Kernel/system developers | Internal architecture, module deep-dives, concurrency model, adding subsystems & endpoints, build system, testing strategy |
-| [`FEATURES_GUIDE.md`](FEATURES_GUIDE.md) | All contributors | Implementation blueprints for Phases 6–10 and all planned enhancements, with file-level change plans, effort estimates, and prioritization |
+| [`SYS_DEV_GUIDE.md`](SYS_DEV_GUIDE.md) | Kernel/system developers | Internal architecture, module deep-dives (marketplace, governance, orchestrator loops), concurrency model, adding subsystems & endpoints, build system, testing strategy |
+| [`FEATURES_GUIDE.md`](FEATURES_GUIDE.md) | All contributors | Implementation blueprints for Phases 6–13 and all planned enhancements, with file-level change plans, effort estimates, and prioritization |
 
 ---
 
@@ -471,9 +514,9 @@ See [SYS_DEV_GUIDE.md](SYS_DEV_GUIDE.md) for systemd service setup, VM provision
 |------|-------------|------------|
 | Embodiment VLA drivers (ROS2, robot arms) | Robotics, Rust | Hard |
 | URI hardware drivers (GPIO, I2C, SPI, CAN bus) | Embedded, Rust | Hard |
-| Decentralized Cognitive Grids | Distributed systems, Rust | Hard |
 | Additional UMI drivers (OpenAI, Anthropic, local GGUF) | Rust, API design | Medium |
-| `.aapp` marketplace API | Java, REST, Spring Boot | Medium |
+| Governance policy UI / dashboard | Java, React/Thymeleaf | Medium |
+| Marketplace remote registry (pull from remote) | Rust, HTTP | Medium |
 | Kubernetes deployment manifests | DevOps, K8s | Easy |
 | More demo scenarios (.aapp packages) | JSON, state machines | Easy |
 | Benchmarking and performance profiling | Rust, profiling tools | Medium |

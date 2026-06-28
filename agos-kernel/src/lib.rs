@@ -13,6 +13,8 @@ pub mod storage;
 pub mod rate_limit;
 pub mod telemetry;
 pub mod orchestrator;
+pub mod marketplace;
+pub mod governance;
 pub mod audit_export;
 
 #[cfg(feature = "z3-solver")]

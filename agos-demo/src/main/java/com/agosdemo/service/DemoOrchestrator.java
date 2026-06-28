@@ -418,5 +418,66 @@ public class DemoOrchestrator {
             if (!names.contains("chef")) throw new RuntimeException("chef not in app list");
             if (!names.contains("supervisor")) throw new RuntimeException("supervisor not in app list");
         });
+
+        // P10: Workflow orchestration
+        var wfId = new AtomicReference<String>();
+
+        runStep("P10", "Create audit workflow definition with loop step", () -> {
+            var definition = mapper.createObjectNode();
+            definition.put("workflow", "audit-workflow-demo");
+            var steps = definition.putArray("steps");
+
+            // Step 1: Financial Auditor performs audit
+            var auditStep = mapper.createObjectNode();
+            auditStep.put("id", "audit");
+            auditStep.put("agent", "Financial Auditor");
+            auditStep.put("timeout_secs", 30);
+            auditStep.put("on_success", "verify");
+            steps.add(auditStep);
+
+            // Step 2: Accountant verifies in a repeat-until loop
+            var verifyStep = mapper.createObjectNode();
+            verifyStep.put("id", "verify");
+            verifyStep.put("agent", "Accountant");
+            verifyStep.put("timeout_secs", 15);
+            verifyStep.put("loop_type", "RepeatUntil");
+            verifyStep.put("loop_condition", "all financial records verified");
+            verifyStep.put("max_iterations", 3);
+            steps.add(verifyStep);
+
+            // Step 3: Financial Auditor compiles final report
+            var reportStep = mapper.createObjectNode();
+            reportStep.put("id", "report");
+            reportStep.put("agent", "Financial Auditor");
+            reportStep.put("timeout_secs", 30);
+            reportStep.put("on_success", "__terminal__");
+            steps.add(reportStep);
+
+            var r = kernel.workflowSubmit(definition);
+            var id = r.path("workflow").path("id").asText();
+            if (id.isEmpty()) throw new RuntimeException("Workflow submit returned no ID: " + r);
+            wfId.set(id);
+        });
+
+        runStep("P10", "Execute audit workflow (spawns 3 agent steps + loop)", () -> {
+            var id = wfId.get();
+            if (id == null) throw new RuntimeException("No workflow ID to execute");
+            var r = kernel.workflowExecute(id);
+            if (!r.path("ok").asBoolean()) throw new RuntimeException("Workflow execute failed: " + r);
+        });
+
+        runStep("P10", "Verify workflow appears in workflow list", () -> {
+            var list = kernel.workflowList();
+            var count = list.path("count").asInt();
+            if (count < 1) throw new RuntimeException("Expected >=1 workflow, got " + count);
+        });
+
+        runStep("P10", "Verify workflow status is Running or Completed", () -> {
+            var id = wfId.get();
+            if (id == null) throw new RuntimeException("No workflow ID");
+            var r = kernel.workflowGet(id);
+            var status = r.path("workflow").path("status").asText();
+            if (status.isEmpty()) throw new RuntimeException("No status field in workflow: " + r);
+        });
     }
 }

@@ -1061,45 +1061,44 @@ kubectl apply -f deploy/k8s/
 
 ### Sub-Agent Orchestration DSL (Completed)
 
-**Motivation**: The current `logic_graphs.json` state machine is limited to flat transitions. A DSL would allow hierarchical sub-agent orchestration with parallel execution, joins, and timeouts.
+**Motivation**: The current `logic_graphs.json` state machine is limited to flat transitions. A DSL would allow hierarchical sub-agent orchestration with loops, parallel execution, joins, and timeouts.
 
 **What Was Built**:
 
-- **`orchestrator.rs`** (`src/orchestrator.rs`) — `SubAgentOrchestrator` struct that manages a map of workflow instances (`HashMap<String, WorkflowInstance>`). Each instance tracks the `WorkflowDefinition` (parsed DSL), its current step, per-step status (`Pending`, `Running`, `Succeeded`, `Failed`, `TimedOut`), child PIDs, and timestamps.
-- **DSL parsing** — the `WorkflowDefinition` YAML/JSON format is parsed in `sandbox.rs` as part of `AAppLoader`. A new optional field `workflow` is extracted from the `.aapp` directory alongside `logic_graphs.json`. The DSL supports:
+- **`orchestrator.rs`** (`src/orchestrator.rs`) — `SubAgentOrchestrator` struct that manages workflow instances (`RwLock<Vec<WorkflowInstance>>`). Each instance tracks the `WorkflowDefinition`, current step (`Option<String>`), per-step results (`HashMap<String, WorkflowStepResult>`), status (`Running`, `Completed`, `Failed`, `TimedOut`), and timestamps.
+- **DSL (WorkflowStep)** — supports:
   - Sequential steps with `on_success` / `on_failure` transitions
-  - Parallel branches (`parallel: [{agent: X}, {agent: Y}]`) with `join: all` or `join: any`
-  - Timeouts per step (`timeout: 30s`)
+  - Parallel branches (`parallel: [WorkflowStep]`) with `join: all` or `join: any`
+  - **Loop steps**: `loop_type` (`RepeatUntil` or `While`), `loop_condition` (UMI-evaluated string), `max_iterations` (default 10)
+  - Per-step timeouts (`timeout_secs`)
   - `__terminal__` sentinel for workflow completion
-- **Sandbox integration** — `InstallResult` now includes a `has_workflow: bool` field; the sandbox loader checks for a `workflow` key in `manifest.json` and stores it during install.
+- **Loop execution** — `execute_loop_step` spawns the same agent repeatedly, evaluating the condition via `umi.reason` after each iteration. `RepeatUntil` continues while condition is false; `While` continues while condition is true. Always terminates at `max_iterations`.
+- **Definition fallback** — `execute_workflow` first checks `aapps/{name}/logic_graphs.json` for steps (filesystem-based), then falls back to the `definition` field stored on `WorkflowInstance` (API-submitted workflows).
 - **REST endpoints**:
-  - `POST /workflow/run {name, aapps_path}` — loads the `.aapp`, parses its workflow DSL, creates a `WorkflowInstance`, spawns the first step as a sub-agent, and returns the workflow ID.
-  - `GET /workflow/status/:id` — returns the current step, overall status, child PIDs, and step-level details.
-- **Kernel wiring** — `agOSKernel` holds a `pub orchestrator: SubAgentOrchestrator` field; the workflow endpoints delegate to orchestrator methods which call `spawn_process` for each step.
-- A workflow step's agent is expected to be another `.aapp` package name; the orchestrator calls `sandbox_install` + `sandbox_launch` under the hood.
+  - `POST /workflow/submit` — accepts a `WorkflowDefinition` JSON body, creates an instance, stores definition for later execution.
+  - `POST /workflow/execute` — accepts `{workflow_id}`, loads steps (filesystem or stored), runs through the DAG.
+  - `GET /workflow/list` — returns all workflow instances.
+  - `GET /workflow/{id}` — returns a single instance with step results.
+- **Kernel wiring** — `agOSKernel` holds a `pub orchestrator: SubAgentOrchestrator` field; workflow delegates to orchestrator methods.
 
 **Key Files**:
 
 | File | Purpose |
 |------|---------|
-| `agos-kernel/src/orchestrator.rs` | `SubAgentOrchestrator`, `WorkflowDefinition`, `WorkflowInstance`, DSL types |
-| `agos-kernel/src/sandbox.rs` | Workflow DSL extraction in `AAppLoader`, `has_workflow` field |
-| `agos-kernel/src/kernel.rs` | `pub orchestrator` field |
-| `agos-kernel/src/api.rs` | `POST /workflow/run`, `GET /workflow/status/:id` routes |
-| `agos-kernel/src/lib.rs` | `pub mod orchestrator` |
+| `agos-kernel/src/orchestrator.rs` | `SubAgentOrchestrator`, `WorkflowDefinition`, `WorkflowInstance`, `WorkflowStep` (with loop fields), `LoopType` |
+| `agos-kernel/src/kernel.rs` | `pub orchestrator` field, `submit_workflow`, `execute_workflow`, `list_workflows`, `get_workflow` |
+| `agos-kernel/src/api.rs` | `POST /workflow/submit`, `POST /workflow/execute`, `GET /workflow/list`, `GET /workflow/:id` routes |
 
-**Example DSL** (in `manifest.json`):
+**Example DSL** (submitted via API):
 
 ```json
 {
-  "name": "Financial Audit",
-  "workflow": {
-    "steps": [
-      {"id": "validate_balance", "agent": "BalanceChecker", "timeout": 30, "on_success": "verify_transactions", "on_failure": "flag_anomaly"},
-      {"id": "verify_transactions", "agent": "TransactionVerifier", "on_success": "generate_report"},
-      {"id": "generate_report", "agent": "ReportGenerator", "on_success": "__terminal__"}
-    ]
-  }
+  "workflow": "Financial Audit",
+  "steps": [
+    {"id": "audit", "agent": "Financial Auditor", "timeout_secs": 30, "on_success": "verify"},
+    {"id": "verify", "agent": "Accountant", "loop_type": "RepeatUntil", "loop_condition": "all records verified", "max_iterations": 3},
+    {"id": "report", "agent": "Financial Auditor", "on_success": "__terminal__"}
+  ]
 }
 ```
 
@@ -1183,6 +1182,127 @@ AGOS_TRUSTED_KEY=$(cat public.pem) cargo run -p agos-kernel
 
 ---
 
+### Phase 12: Agent Marketplace (Completed)
+
+**Motivation**: Provide a central catalog for discovering, searching, building, and recommending agents — enabling agent reusability and compositional workflows.
+
+**What Was Built**:
+
+- **`marketplace.rs`** (`src/marketplace.rs`) — defines the `AgentMarketplace` struct with:
+  - **`AgentListing`** — metadata for each agent (name, version, capabilities, permissions, token_quota, priority, workflow flag, state count, tool count).
+  - **`AgentSearchQuery`** — search filters: text query, capability, min/max priority, has_workflow, limit.
+  - **`AgentTemplate` / `AgentTemplateInfo`** — three built-in templates (`data_analyzer`, `report_generator`, `validator`) with default permissions, token quotas, and state machines.
+  - **`AgentBuildRequest` / `AgentBuildResult`** — API-driven agent generation that creates `.aapp` directory structures from templates or custom state machine definitions.
+  - **`AgentRecommendation` / `RecommendedStep`** — goal→workflow recommendation output using UMI reasoning.
+  - **`scan_local(aapps_path)`** — walks `.aapp` directories, extracts listings via `AgentListing::from_aapp_path`, populates the in-memory registry.
+  - **`search_agents(query)`** — filters registry by text, capability, priority range, workflow flag.
+  - **`build_agent(request, aapps_path, kernel)`** — creates manifest.json + logic_graphs.json on disk, creates empty tools/ and validation_tests/ dirs, rescans catalog, logs to episodic ledger.
+  - **`recommend_agents(goal, kernel)`** — constructs a UMI prompt with the goal and available agent catalog, parses the response into structured steps with confidence scores and a runnable workflow.
+- **REST endpoints**:
+  - `GET /marketplace/list` — list all agents
+  - `POST /marketplace/search` — search with filters
+  - `GET /marketplace/agent/{name}` — get single agent
+  - `POST /marketplace/scan` — rescan local aapps/
+  - `GET /marketplace/templates` — list built-in templates
+  - `POST /marketplace/build` — build agent from template/custom spec
+  - `POST /marketplace/recommend` — goal→workflow recommendation
+- **Kernel wiring** — `agOSKernel` holds a `pub marketplace: AgentMarketplace` field; initialized in `new()`, auto-scans `aapps/` on startup.
+
+**Key Files**:
+
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/marketplace.rs` | `AgentMarketplace`, `AgentListing`, `AgentSearchQuery`, templates, build, recommend |
+| `agos-kernel/src/kernel.rs` | `pub marketplace` field, delegation methods |
+| `agos-kernel/src/api.rs` | 7 `/marketplace/*` routes |
+
+**Testing**:
+
+```bash
+# List agents
+curl http://127.0.0.1:7400/marketplace/list
+
+# Search by capability
+curl -X POST http://127.0.0.1:7400/marketplace/search \
+  -H 'Content-Type: application/json' \
+  -d '{"capability": "financial"}'
+
+# List templates
+curl http://127.0.0.1:7400/marketplace/templates
+
+# Build agent
+curl -X POST http://127.0.0.1:7400/marketplace/build \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "TestAgent", "description": "test", "capabilities": ["test"], "permissions": ["umi:reason"], "token_quota": 1000, "priority": 1}'
+
+# Recommend
+curl -X POST http://127.0.0.1:7400/marketplace/recommend \
+  -H 'Content-Type: application/json' \
+  -d '{"goal": "Audit financial records"}'
+```
+
+---
+
+### Phase 13: Governance Engine (Completed)
+
+**Motivation**: Provide declarative compliance and governance for agent behavior — contracts with resource limits, permission scoping, rules evaluation, and audit logging.
+
+**What Was Built**:
+
+- **`governance.rs`** (`src/governance.rs`) — defines the `ContractEngine` struct with:
+  - **`GovernanceContract`** — contract with `contract_id` (UUID), `name`, `description`, `rules: Vec<ContractRule>`, `limits: ContractLimits`, `success_criteria: SuccessCriteria`, `created_by`.
+  - **`ContractRule`** — `field` (dot-separated manifest path), `operator` (`eq`, `lt`, `gt`, `contains`), `value` (JSON Value).
+  - **`ContractLimits`** — `max_tokens_per_run`, `max_subagents`, `max_execution_seconds`, `max_memory_pages`, `allowed_permissions` (allowlist).
+  - **`SuccessCriteria`** — `min_goal_metric`, `required_output_fields`, `min_steps_completed`, `no_error_states`.
+  - **`ComplianceReport`** — contract_id, contract_name, agent_name, compliant (bool), violations (string list), timestamp.
+  - **`ComplianceSummary`** — total_contracts, total_checks, compliant_checks, violation_checks, top_violations (top 10).
+  - **`GovernancePolicy`** — bundles multiple contract IDs under a named policy with active flag.
+  - **`check_compliance(instance)`** — evaluates all rules against an `AAppInstance` manifest:
+    - Rules: navigates manifest via dot-separated path, applies operator comparison.
+    - Limits: checks max_tokens, max_subagents, allowed_permissions.
+    - Returns compliance report with all violations.
+  - **`check_agent_compliance(instance)`** — runs compliance against all registered contracts, logs every check to the audit log.
+  - **`get_compliance_summary()`** — aggregates all checks into a summary with top violation counts.
+  - **`create_policy(name, desc, contract_ids)`** — creates a policy linking multiple contracts.
+- **REST endpoints**:
+  - `POST /governance/contract/create` — create contract with rules, limits, success criteria
+  - `GET /governance/contract/{id}` — get contract by ID
+  - `GET /governance/contracts` — list all contracts
+  - `POST /governance/contract/{id}/remove` — remove a contract
+  - `GET /governance/compliance` — compliance summary
+  - `GET /governance/audit` — compliance audit log
+  - `POST /governance/policy/create` — create policy
+  - `GET /governance/policies` — list policies
+- **Kernel wiring** — `agOSKernel` holds a `pub governance: ContractEngine` field; initialized in `new()`.
+
+**Key Files**:
+
+| File | Purpose |
+|------|---------|
+| `agos-kernel/src/governance.rs` | `ContractEngine`, `GovernanceContract`, `ContractRule`, `ContractLimits`, `SuccessCriteria`, `ComplianceReport`, `GovernancePolicy` |
+| `agos-kernel/src/kernel.rs` | `pub governance` field, delegation methods |
+| `agos-kernel/src/api.rs` | 8 `/governance/*` routes |
+
+**Testing**:
+
+```bash
+# Create a contract
+curl -X POST http://127.0.0.1:7400/governance/contract/create \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Strict", "description": "Strict limits", "limits": {"max_tokens_per_run": 8000}}'
+
+# List contracts
+curl http://127.0.0.1:7400/governance/contracts
+
+# Get compliance summary
+curl http://127.0.0.1:7400/governance/compliance
+
+# Get audit log
+curl http://127.0.0.1:7400/governance/audit
+```
+
+---
+
 ## Feature Prioritization
 
 | Feature | Effort | Impact | Dependencies | Status |
@@ -1194,7 +1314,7 @@ AGOS_TRUSTED_KEY=$(cat public.pem) cargo run -p agos-kernel
 | Secure .aapp Signing | 2 days | Medium — supply chain security | None | ✓ Implemented |
 | Structured Audit Export | 2 days | Medium — compliance use cases | None | ✓ Implemented |
 | **Phase 6**: Episodic Compression Daemon | ✓ | — | — | ✓ Complete |
-| Sub-Agent Orchestration DSL | 5 days | High — agent composability | None | ✓ Implemented |
+| Sub-Agent Orchestration DSL (loops, parallel) | 5 days | High — agent composability | None | ✓ Implemented |
 | **Phase 7**: Z3 SMT Solver | 5 days | Medium — formal verification | None | ✓ Complete |
 | OpenTelemetry Instrumentation | 2 days | Medium — observability | None | ✓ Implemented |
 | **Phase 8**: WebAssembly Sandbox | 2 weeks | High — secure tool execution | wasmtime | ✓ Complete |
@@ -1202,10 +1322,8 @@ AGOS_TRUSTED_KEY=$(cat public.pem) cargo run -p agos-kernel
 | **Phase 9**: Embodiment Layer | 3 weeks | High — robotics use cases | UMI, WASM sandbox | ✓ Complete |
 | **Phase 10**: Decentralized Grids | 4 weeks | High — scale-out architecture | Persistent Storage | ✓ Complete |
 | **Phase 11**: URI + Hardware Control | 2 weeks | High — hardware abstraction | None | ✓ Complete |
-
----
-
-## Design Principles for New Features
+| **Phase 12**: Agent Marketplace | 3 days | Medium — agent discoverability | None | ✓ Complete |
+| **Phase 13**: Governance Engine | 3 days | High — agent compliance | None | ✓ Complete |
 
 1. **Backward compatibility** — existing `.aapp` packages and REST clients must continue to work without modification.
 2. **Opt-in complexity** — default configuration should be the simplest possible (in-memory, single-node). Advanced features (persistence, clustering) are opt-in.

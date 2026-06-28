@@ -14,6 +14,7 @@ use tracing::instrument;
 
 use crate::audit_export::{JsonlExporter, StdoutExporter};
 use crate::kernel::agOSKernel;
+use crate::marketplace::{AgentBuildRequest, AgentSearchQuery};
 use crate::orchestrator::WorkflowDefinition;
 use crate::sandbox::{AAppLoader, InstallResult};
 
@@ -132,6 +133,21 @@ pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
         .route("/controller/stats", get(controller_stats));
 
     let router = router
+        .route("/marketplace/list", get(marketplace_list))
+        .route("/marketplace/search", post(marketplace_search))
+        .route("/marketplace/agent/:name", get(marketplace_get_agent))
+        .route("/marketplace/scan", post(marketplace_scan))
+        .route("/marketplace/templates", get(marketplace_templates))
+        .route("/marketplace/build", post(marketplace_build))
+        .route("/marketplace/recommend", post(marketplace_recommend))
+        .route("/governance/contract/create", post(governance_contract_create))
+        .route("/governance/contract/:id", get(governance_contract_get))
+        .route("/governance/contracts", get(governance_contracts))
+        .route("/governance/contract/:id/remove", post(governance_contract_remove))
+        .route("/governance/compliance", get(governance_compliance_summary))
+        .route("/governance/audit", get(governance_audit_log))
+        .route("/governance/policy/create", post(governance_policy_create))
+        .route("/governance/policies", get(governance_policies))
         .route("/security/audit/export", post(security_audit_export))
         .route("/workflow/submit", post(workflow_submit))
         .route("/workflow/execute", post(workflow_execute))
@@ -1526,4 +1542,212 @@ async fn grid_cipc_forward(
         Ok(msg) => Json(serde_json::json!({"ok": true, "message_id": msg.id})),
         Err(e) => Json(serde_json::json!({"error": e})),
     }
+}
+
+// ── Marketplace ─────────────────────────────────────────────
+
+async fn marketplace_list(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let agents = kernel.list_marketplace_agents();
+    Json(serde_json::json!({"agents": agents, "count": agents.len()}))
+}
+
+async fn marketplace_search(
+    State(kernel): State<KernelState>,
+    Json(query): Json<AgentSearchQuery>,
+) -> Json<Value> {
+    let results = kernel.search_marketplace(&query);
+    Json(serde_json::json!({"results": results, "count": results.len()}))
+}
+
+async fn marketplace_get_agent(
+    State(kernel): State<KernelState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    match kernel.get_marketplace_agent(&name) {
+        Some(agent) => Json(serde_json::json!({"agent": agent})),
+        None => Json(serde_json::json!({"error": format!("Agent '{}' not found", name)})),
+    }
+}
+
+async fn marketplace_scan(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let agents = kernel.scan_marketplace();
+    Json(serde_json::json!({"agents": agents, "count": agents.len(), "scanned": true}))
+}
+
+async fn marketplace_templates(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let templates = kernel.list_templates();
+    Json(serde_json::json!({"templates": templates, "count": templates.len()}))
+}
+
+async fn marketplace_build(
+    State(kernel): State<KernelState>,
+    Json(req): Json<AgentBuildRequest>,
+) -> Json<Value> {
+    match kernel.build_agent(&req) {
+        Ok(result) => Json(serde_json::json!({"ok": true, "agent": result})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecommendRequest {
+    goal: String,
+}
+
+async fn marketplace_recommend(
+    State(kernel): State<KernelState>,
+    Json(req): Json<RecommendRequest>,
+) -> Json<Value> {
+    match kernel.recommend_agents_for_goal(&req.goal).await {
+        Ok(recommendation) => Json(serde_json::json!({"ok": true, "recommendation": recommendation})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+// ── Governance ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateContractRequest {
+    name: String,
+    description: String,
+    rules: Option<Vec<ContractRuleInput>>,
+    limits: Option<ContractLimitsInput>,
+    success_criteria: Option<SuccessCriteriaInput>,
+}
+
+#[derive(Deserialize)]
+struct ContractRuleInput {
+    field: String,
+    operator: String,
+    value: Value,
+}
+
+#[derive(Deserialize)]
+struct ContractLimitsInput {
+    max_tokens_per_run: Option<u64>,
+    max_subagents: Option<u32>,
+    max_execution_seconds: Option<u64>,
+    max_memory_pages: Option<u32>,
+    allowed_permissions: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SuccessCriteriaInput {
+    min_goal_metric: Option<f64>,
+    required_output_fields: Option<Vec<String>>,
+    min_steps_completed: Option<u32>,
+    no_error_states: Option<bool>,
+}
+
+async fn governance_contract_create(
+    State(kernel): State<KernelState>,
+    Json(req): Json<CreateContractRequest>,
+) -> Json<Value> {
+    let mut contract = crate::governance::GovernanceContract::new(&req.name, &req.description, "api");
+
+    if let Some(rules) = req.rules {
+        let contract_rules: Vec<crate::governance::ContractRule> = rules
+            .into_iter()
+            .map(|r| crate::governance::ContractRule {
+                field: r.field,
+                operator: r.operator,
+                value: r.value,
+            })
+            .collect();
+        contract = contract.with_rules(contract_rules);
+    }
+
+    if let Some(limits) = req.limits {
+        contract = contract.with_limits(crate::governance::ContractLimits {
+            max_tokens_per_run: limits.max_tokens_per_run,
+            max_subagents: limits.max_subagents,
+            max_execution_seconds: limits.max_execution_seconds,
+            max_memory_pages: limits.max_memory_pages,
+            allowed_permissions: limits.allowed_permissions,
+        });
+    }
+
+    if let Some(criteria) = req.success_criteria {
+        contract = contract.with_success_criteria(crate::governance::SuccessCriteria {
+            min_goal_metric: criteria.min_goal_metric,
+            required_output_fields: criteria.required_output_fields,
+            min_steps_completed: criteria.min_steps_completed,
+            no_error_states: criteria.no_error_states,
+        });
+    }
+
+    match kernel.register_contract(contract) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "contract": kernel.list_contracts().last().cloned()})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn governance_contract_get(
+    State(kernel): State<KernelState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    match kernel.get_contract(&id) {
+        Some(contract) => Json(serde_json::json!({"contract": contract})),
+        None => Json(serde_json::json!({"error": "Contract not found"})),
+    }
+}
+
+async fn governance_contracts(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let contracts = kernel.list_contracts();
+    Json(serde_json::json!({"contracts": contracts, "count": contracts.len()}))
+}
+
+async fn governance_contract_remove(
+    State(kernel): State<KernelState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    if kernel.remove_contract(&id) {
+        Json(serde_json::json!({"ok": true}))
+    } else {
+        Json(serde_json::json!({"error": "Contract not found"}))
+    }
+}
+
+async fn governance_compliance_summary(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let summary = kernel.get_compliance_summary();
+    Json(serde_json::json!({"summary": summary}))
+}
+
+async fn governance_audit_log(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let log = kernel.get_audit_log(Some(50));
+    Json(serde_json::json!({"audit_log": log, "count": log.len()}))
+}
+
+#[derive(Deserialize)]
+struct CreatePolicyRequest {
+    name: String,
+    description: String,
+    contract_ids: Vec<String>,
+}
+
+async fn governance_policy_create(
+    State(kernel): State<KernelState>,
+    Json(req): Json<CreatePolicyRequest>,
+) -> Json<Value> {
+    let policy = kernel.create_policy(&req.name, &req.description, req.contract_ids);
+    Json(serde_json::json!({"ok": true, "policy": policy}))
+}
+
+async fn governance_policies(
+    State(kernel): State<KernelState>,
+) -> Json<Value> {
+    let policies = kernel.list_policies();
+    Json(serde_json::json!({"policies": policies, "count": policies.len()}))
 }

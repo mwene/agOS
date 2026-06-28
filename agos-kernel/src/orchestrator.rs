@@ -8,6 +8,12 @@ use uuid::Uuid;
 use crate::kernel::agOSKernel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LoopType {
+    RepeatUntil,
+    While,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStep {
     pub id: String,
     pub agent: String,
@@ -16,6 +22,9 @@ pub struct WorkflowStep {
     pub on_failure: Option<String>,
     pub parallel: Option<Vec<WorkflowStep>>,
     pub join: Option<String>,
+    pub loop_type: Option<LoopType>,
+    pub loop_condition: Option<String>,
+    pub max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +42,7 @@ pub struct WorkflowInstance {
     pub step_results: HashMap<String, WorkflowStepResult>,
     pub created_at: String,
     pub updated_at: String,
+    pub definition: Option<WorkflowDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +93,27 @@ impl SubAgentOrchestrator {
             step_results: HashMap::new(),
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
+            definition: Some(definition),
+        };
+
+        let mut workflows = self.workflows.write().await;
+        workflows.push(instance.clone());
+        instance
+    }
+
+    pub async fn submit_workflow_definition(
+        &self,
+        definition: &WorkflowDefinition,
+    ) -> WorkflowInstance {
+        let instance = WorkflowInstance {
+            id: format!("wf-{}", &Uuid::new_v4().to_string()[..12]),
+            name: definition.workflow.clone(),
+            status: WorkflowStatus::Running,
+            current_step: definition.steps.first().map(|s| s.id.clone()),
+            step_results: HashMap::new(),
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            definition: Some(definition.clone()),
         };
 
         let mut workflows = self.workflows.write().await;
@@ -123,8 +154,10 @@ impl SubAgentOrchestrator {
                     workflow: definition.name.clone(),
                     steps,
                 }
+            } else if let Some(ref def) = definition.definition {
+                def.clone()
             } else {
-                return Err(format!("No workflow DSL found for '{}'", definition.name));
+                return Err(format!("No workflow DSL found for '{}' and no stored definition", definition.name));
             }
         };
 
@@ -140,7 +173,9 @@ impl SubAgentOrchestrator {
         kernel: &agOSKernel,
     ) -> Result<(), String> {
         for step in steps {
-            if let Some(ref parallel_steps) = step.parallel {
+            if step.loop_type.is_some() {
+                self.execute_loop_step(_workflow_name, step, kernel).await?;
+            } else if let Some(ref parallel_steps) = step.parallel {
                 let join_type = step.join.as_deref().unwrap_or("all");
                 let mut handles = Vec::new();
                 for pstep in parallel_steps {
@@ -176,6 +211,50 @@ impl SubAgentOrchestrator {
             }
         }
         Ok(())
+    }
+
+    async fn execute_loop_step(
+        &self,
+        _workflow_name: &str,
+        step: &WorkflowStep,
+        kernel: &agOSKernel,
+    ) -> Result<(), String> {
+        let max_iter = step.max_iterations.unwrap_or(10) as usize;
+        let loop_type = step.loop_type.as_ref().unwrap();
+
+        for iteration in 0..max_iter {
+            let manifest = serde_json::json!({
+                "name": format!("{}:{}:iter{}", _workflow_name, step.agent, iteration),
+                "agent": step.agent,
+                "limits": { "max_tokens": 5000 },
+                "priority": 2,
+            });
+            let _ctx = kernel.spawn_process(manifest, None).await;
+
+            if let Some(ref condition) = step.loop_condition {
+                let should_continue = match loop_type {
+                    LoopType::RepeatUntil => {
+                        let done = self.check_condition(condition, kernel).await;
+                        !done
+                    }
+                    LoopType::While => {
+                        self.check_condition(condition, kernel).await
+                    }
+                };
+                if !should_continue {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_condition(&self, condition: &str, kernel: &agOSKernel) -> bool {
+        let result = kernel.umi.reason(
+            &[format!("Evaluate whether this condition is true or false. Respond with only 'true' or 'false'. Condition: {}", condition)],
+            &serde_json::json!({"task": "condition_check"}),
+        ).await;
+        result.output.first().map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false)
     }
 
     pub async fn list_workflows(&self) -> Vec<WorkflowInstance> {

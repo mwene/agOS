@@ -6,7 +6,9 @@ use uuid::Uuid;
 use crate::audit_export::{AuditExporter, ExportFormat, ExportResult};
 use crate::auth::AuthConfig;
 use crate::cipc::CIPCBus;
+use crate::governance::{ComplianceReport, ComplianceSummary, ContractEngine, GovernanceContract, GovernancePolicy};
 use crate::grid::CognitiveGrid;
+use crate::marketplace::{AgentBuildRequest, AgentBuildResult, AgentListing, AgentMarketplace, AgentRecommendation, AgentSearchQuery};
 use crate::memory::HierarchicalMemoryManager;
 use crate::models::ModelRegistry;
 use crate::orchestrator::{SubAgentOrchestrator, WorkflowDefinition};
@@ -46,6 +48,8 @@ pub struct agOSKernel {
     pub rate_limiter: RateLimiter,
     pub model_registry: Arc<ModelRegistry>,
     pub orchestrator: SubAgentOrchestrator,
+    pub marketplace: AgentMarketplace,
+    pub governance: ContractEngine,
     #[cfg(feature = "embodiment")]
     pub embodiment: EmbodimentLayer,
     #[cfg(feature = "uri")]
@@ -86,6 +90,9 @@ impl agOSKernel {
         // always see the (possibly user-overridden) pricing data
         scheduler.model_registry = model_registry.clone();
 
+        let marketplace = AgentMarketplace::new();
+        marketplace.scan_local("aapps");
+
         agOSKernel {
             scheduler,
             memory,
@@ -98,6 +105,8 @@ impl agOSKernel {
             model_registry,
             store,
             orchestrator: SubAgentOrchestrator::new(),
+            marketplace,
+            governance: ContractEngine::new(),
             #[cfg(feature = "embodiment")]
             embodiment: EmbodimentLayer::new(),
             #[cfg(feature = "uri")]
@@ -326,5 +335,69 @@ impl agOSKernel {
 
     pub async fn get_workflow(&self, id: &str) -> Option<crate::orchestrator::WorkflowInstance> {
         self.orchestrator.get_workflow(id).await
+    }
+
+    // ---- Marketplace ----
+
+    pub fn list_marketplace_agents(&self) -> Vec<AgentListing> {
+        self.marketplace.list_agents()
+    }
+
+    pub fn search_marketplace(&self, query: &AgentSearchQuery) -> Vec<AgentListing> {
+        self.marketplace.search_agents(query)
+    }
+
+    pub fn get_marketplace_agent(&self, name: &str) -> Option<AgentListing> {
+        self.marketplace.get_agent(name)
+    }
+
+    pub fn scan_marketplace(&self) -> Vec<AgentListing> {
+        self.marketplace.scan_local("aapps")
+    }
+
+    pub fn list_templates(&self) -> Vec<crate::marketplace::AgentTemplateInfo> {
+        self.marketplace.list_templates()
+    }
+
+    pub fn build_agent(&self, request: &AgentBuildRequest) -> Result<AgentBuildResult, String> {
+        self.marketplace.build_agent(request, "aapps", self)
+    }
+
+    pub async fn recommend_agents_for_goal(&self, goal: &str) -> Result<AgentRecommendation, String> {
+        self.marketplace.recommend_agents(goal, self).await
+    }
+
+    // ---- Governance ----
+
+    pub fn register_contract(&self, contract: GovernanceContract) -> Result<(), String> {
+        self.governance.register_contract(contract)
+    }
+
+    pub fn get_contract(&self, contract_id: &str) -> Option<GovernanceContract> {
+        self.governance.get_contract(contract_id)
+    }
+
+    pub fn list_contracts(&self) -> Vec<GovernanceContract> {
+        self.governance.list_contracts()
+    }
+
+    pub fn remove_contract(&self, contract_id: &str) -> bool {
+        self.governance.remove_contract(contract_id)
+    }
+
+    pub fn get_compliance_summary(&self) -> ComplianceSummary {
+        self.governance.get_compliance_summary()
+    }
+
+    pub fn get_audit_log(&self, limit: Option<usize>) -> Vec<ComplianceReport> {
+        self.governance.get_audit_log(limit)
+    }
+
+    pub fn create_policy(&self, name: &str, description: &str, contract_ids: Vec<String>) -> GovernancePolicy {
+        self.governance.create_policy(name, description, contract_ids)
+    }
+
+    pub fn list_policies(&self) -> Vec<GovernancePolicy> {
+        self.governance.list_policies()
     }
 }

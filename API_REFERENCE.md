@@ -516,37 +516,96 @@ Response:
 
 ## Workflow Orchestration
 
-### `POST /workflow/run` — Run a workflow from a .aapp package
+### `POST /workflow/submit` — Submit a workflow definition
 
 ```json
-{"name": "financial_audit", "aapps_path": "aapps"}
+{
+  "workflow": "audit-workflow",
+  "steps": [
+    {"id": "audit", "agent": "Financial Auditor", "timeout_secs": 30, "on_success": "verify"},
+    {"id": "verify", "agent": "Accountant", "loop_type": "RepeatUntil", "loop_condition": "all records verified", "max_iterations": 3},
+    {"id": "report", "agent": "Financial Auditor", "on_success": "__terminal__"}
+  ]
+}
 ```
 
-Response:
-```json
-{"workflow_id": "wf-abc123", "status": "running", "current_step": "validate_balance"}
-```
+**Step fields:**
 
-### `GET /workflow/status/:id` — Get workflow status
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique step identifier |
+| `agent` | string | Agent name (`.aapp` package or built-in) |
+| `timeout_secs` | int? | Max seconds before step is marked TimedOut |
+| `on_success` | string? | Next step ID on success, or `"__terminal__"` |
+| `on_failure` | string? | Next step ID on failure |
+| `parallel` | array? | Child steps for parallel execution |
+| `join` | string? | `"all"` or `"any"` join strategy |
+| `loop_type` | string? | `"RepeatUntil"` or `"While"` |
+| `loop_condition` | string? | UMI-evaluated condition expression |
+| `max_iterations` | int? | Max loop iterations (default 10) |
 
 Response:
 ```json
 {
-  "workflow_id": "wf-abc123",
-  "status": "running",
-  "definition": {"steps": [...]},
-  "current_step": "verify_transactions",
-  "steps": {
-    "validate_balance": {"status": "succeeded", "child_pid": "proc-...", "started_at": "...", "completed_at": "..."},
-    "verify_transactions": {"status": "running", "child_pid": "proc-...", "started_at": "..."}
-  },
-  "created_at": "..."
+  "ok": true,
+  "workflow": {
+    "id": "wf-a1b2c3d4e5f6",
+    "name": "audit-workflow",
+    "status": "Running",
+    "current_step": "audit",
+    "step_results": {},
+    "created_at": "2026-06-28T12:00:00Z",
+    "updated_at": "2026-06-28T12:00:00Z",
+    "definition": {...}
+  }
+}
+```
+
+### `POST /workflow/execute` — Execute a submitted workflow
+
+```json
+{"workflow_id": "wf-a1b2c3d4e5f6"}
+```
+
+Response:
+```json
+{"ok": true, "workflow_id": "wf-a1b2c3d4e5f6"}
+```
+
+### `GET /workflow/list` — List all workflow instances
+
+Response:
+```json
+{
+  "workflows": [
+    {"id": "wf-...", "name": "audit-workflow", "status": "Running", ...}
+  ],
+  "count": 1
+}
+```
+
+### `GET /workflow/:id` — Get workflow instance details
+
+Response:
+```json
+{
+  "workflow": {
+    "id": "wf-a1b2c3d4e5f6",
+    "name": "audit-workflow",
+    "status": "Running",
+    "current_step": "verify",
+    "step_results": {
+      "audit": {"step_id": "audit", "agent": "Financial Auditor", "status": "completed", "pid": "proc-...", "elapsed_ms": 1200}
+    },
+    "created_at": "...",
+    "updated_at": "..."
+  }
 }
 ```
 
 Error:
 ```json
-{"error": "Workflow not found", "workflow_id": "wf-nonexistent"}
+{"error": "Workflow not found"}
 ```
 
 ---
@@ -1003,4 +1062,330 @@ Response:
 Response:
 ```json
 {"ok": true, "message_id": "msg-..."}
+```
+
+---
+
+## Marketplace
+
+### `GET /marketplace/list` — List all agents in the catalog
+
+Response:
+```json
+{
+  "agents": [
+    {
+      "name": "Financial Auditor",
+      "version": "1.0.0",
+      "description": "Multi-agent financial validation and auditing suite",
+      "capabilities": ["financial:read", "financial:validate"],
+      "permissions": ["financial:read", "financial:validate", "cipc:communicate"],
+      "token_quota": 5000,
+      "priority": 2,
+      "has_workflow": true,
+      "states": 5,
+      "tool_count": 2,
+      "source": "local",
+      "installed": true
+    }
+  ],
+  "count": 2
+}
+```
+
+### `POST /marketplace/search` — Search agents
+
+```json
+{
+  "query": "audit",
+  "capability": "financial",
+  "min_priority": 1,
+  "max_priority": 5,
+  "has_workflow": true,
+  "limit": 20
+}
+```
+
+**Search fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `query` | string? | Text search across name, description, capabilities |
+| `capability` | string? | Filter by capability name |
+| `min_priority` | int? | Minimum scheduling priority |
+| `max_priority` | int? | Maximum scheduling priority |
+| `has_workflow` | bool? | Filter by workflow support |
+| `limit` | int? | Max results (default 20) |
+
+Response:
+```json
+{"results": [...], "count": 1}
+```
+
+### `GET /marketplace/agent/{name}` — Get agent by name
+
+Response:
+```json
+{"agent": {"name": "Financial Auditor", ...}}
+```
+
+Error:
+```json
+{"error": "Agent 'Unknown' not found"}
+```
+
+### `POST /marketplace/scan` — Scan local `aapps/` directory
+
+Response:
+```json
+{"agents": [...], "count": 2, "scanned": true}
+```
+
+### `GET /marketplace/templates` — List built-in agent templates
+
+Response:
+```json
+{
+  "templates": [
+    {"name": "data_analyzer", "description": "Analyzes data and returns structured insights", "default_permissions": ["memory:page", "umi:reason"], "default_token_quota": 5000, "default_priority": 2},
+    {"name": "report_generator", "description": "Generates structured reports from input data", "default_permissions": ["memory:page", "umi:reason"], "default_token_quota": 8000, "default_priority": 2},
+    {"name": "validator", "description": "Validates data against rules and constraints", "default_permissions": ["financial:read", "financial:validate", "umi:reason"], "default_token_quota": 3000, "default_priority": 1}
+  ],
+  "count": 3
+}
+```
+
+### `POST /marketplace/build` — Build a new agent from template or custom spec
+
+```json
+{
+  "name": "CustomAnalyzer",
+  "description": "Custom data analysis agent",
+  "capabilities": ["data:analyze", "report:generate"],
+  "permissions": ["memory:page", "umi:reason"],
+  "token_quota": 5000,
+  "priority": 2,
+  "states": [
+    {"name": "start", "transitions": {"done": "__terminal__"}}
+  ],
+  "template_name": "data_analyzer"
+}
+```
+
+**Build fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Agent name (also used as directory name) |
+| `description` | string | Human-readable description |
+| `capabilities` | string[] | Agent capability tags |
+| `permissions` | string[] | Ring 0 permission scopes |
+| `token_quota` | int | Max tokens before forced termination |
+| `priority` | int | Scheduling priority |
+| `states` | array? | Custom state machine definitions |
+| `template_name` | string? | Name of a built-in template to seed from |
+
+Response:
+```json
+{
+  "ok": true,
+  "agent": {
+    "name": "CustomAnalyzer",
+    "path": "aapps/CustomAnalyzer",
+    "manifest": {...},
+    "logic_graphs": {...},
+    "installed": true
+  }
+}
+```
+
+### `POST /marketplace/recommend` — Recommend agents for a goal
+
+```json
+{"goal": "Audit the financial records for Q1 and generate a report"}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "recommendation": {
+    "goal": "Audit the financial records for Q1 and generate a report",
+    "recommended_steps": [
+      {
+        "step_id": "step_1",
+        "description": "Audit financial records for Q1",
+        "recommended_agent": "Financial Auditor",
+        "confidence": 0.92,
+        "alternatives": ["Accountant"]
+      }
+    ],
+    "workflow": {
+      "workflow": "auto-a1b2c3d4",
+      "steps": [
+        {"id": "step_1", "agent": "Financial Auditor", "timeout_secs": 60, "on_success": "__terminal__", ...}
+      ]
+    },
+    "reasoning": ["Step 'step_1': Financial Auditor has financial:read and financial:validate capabilities"]
+  }
+}
+```
+
+---
+
+## Governance
+
+### `POST /governance/contract/create` — Create a governance contract
+
+```json
+{
+  "name": "Strict Financial Audit",
+  "description": "Contracts for financial agent compliance",
+  "rules": [
+    {"field": "limits.max_tokens", "operator": "lt", "value": 10000},
+    {"field": "priority", "operator": "lt", "value": 5}
+  ],
+  "limits": {
+    "max_tokens_per_run": 8000,
+    "max_subagents": 3,
+    "max_execution_seconds": 3600,
+    "allowed_permissions": ["financial:read", "financial:validate", "umi:reason"]
+  },
+  "success_criteria": {
+    "min_goal_metric": 0.8,
+    "required_output_fields": ["report"],
+    "min_steps_completed": 2,
+    "no_error_states": true
+  }
+}
+```
+
+**Contract fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Contract name |
+| `description` | string | Human-readable description |
+| `rules` | array? | Compliance rules (field, operator, value) |
+| `rules[].field` | string | Dot-separated manifest field path |
+| `rules[].operator` | string | `"eq"`, `"lt"`, `"gt"`, or `"contains"` |
+| `rules[].value` | any | Expected or threshold value |
+| `limits` | object? | Resource and permission limits |
+| `limits.max_tokens_per_run` | int? | Max total token consumption |
+| `limits.max_subagents` | int? | Max child processes |
+| `limits.max_execution_seconds` | int? | Max wall-clock time |
+| `limits.max_memory_pages` | int? | Max Vector RAM pages |
+| `limits.allowed_permissions` | string[]? | Allowlisted permission scopes |
+| `success_criteria` | object? | Conditions for compliance success |
+| `success_criteria.min_goal_metric` | float? | Minimum goal_metric threshold |
+| `success_criteria.required_output_fields` | string[]? | Required output fields |
+| `success_criteria.min_steps_completed` | int? | Minimum completed steps |
+| `success_criteria.no_error_states` | bool? | Reject any error state |
+
+Response:
+```json
+{
+  "ok": true,
+  "contract": {
+    "contract_id": "uuid-...",
+    "name": "Strict Financial Audit",
+    "description": "Contracts for financial agent compliance",
+    "rules": [...],
+    "limits": {...},
+    "success_criteria": {...},
+    "created_by": "api"
+  }
+}
+```
+
+### `GET /governance/contract/{id}` — Get a contract by ID
+
+Response:
+```json
+{"contract": {"contract_id": "uuid-...", "name": "...", ...}}
+```
+
+Error:
+```json
+{"error": "Contract not found"}
+```
+
+### `GET /governance/contracts` — List all contracts
+
+Response:
+```json
+{"contracts": [...], "count": 2}
+```
+
+### `POST /governance/contract/{id}/remove` — Remove a contract
+
+Response:
+```json
+{"ok": true}
+```
+
+Error:
+```json
+{"error": "Contract not found"}
+```
+
+### `GET /governance/compliance` — Get compliance summary
+
+Response:
+```json
+{
+  "summary": {
+    "total_contracts": 3,
+    "total_checks": 15,
+    "compliant_checks": 12,
+    "violation_checks": 3,
+    "top_violations": [["max_tokens exceeded", 2], ["permission not allowed", 1]]
+  }
+}
+```
+
+### `GET /governance/audit` — Get compliance audit log
+
+Response:
+```json
+{
+  "audit_log": [
+    {
+      "contract_id": "uuid-...",
+      "contract_name": "Strict Financial Audit",
+      "agent_name": "test-agent",
+      "compliant": false,
+      "violations": ["Limit exceeded: max_tokens 5000 > 800"],
+      "timestamp": "2026-06-28T12:00:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+### `POST /governance/policy/create` — Create a governance policy
+
+```json
+{"name": "prod-policy", "description": "Production deployment policy", "contract_ids": ["uuid-1", "uuid-2"]}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "policy": {
+    "policy_id": "uuid-...",
+    "name": "prod-policy",
+    "description": "Production deployment policy",
+    "contracts": ["uuid-1", "uuid-2"],
+    "is_active": true
+  }
+}
+```
+
+### `GET /governance/policies` — List all policies
+
+Response:
+```json
+{"policies": [...], "count": 1}
 ```

@@ -265,4 +265,22 @@ public class AgosKernelClient {
     public JsonNode controllerStats() {
         return client.get().uri("/controller/stats").retrieve().body(JsonNode.class);
     }
+
+    // ── Workflow ─────────────────────────────────────────
+    public JsonNode workflowSubmit(ObjectNode definition) {
+        return client.post().uri("/workflow/submit").body(definition).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode workflowExecute(String workflowId) {
+        var body = mapper.createObjectNode().put("workflow_id", workflowId);
+        return client.post().uri("/workflow/execute").body(body).retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode workflowList() {
+        return client.get().uri("/workflow/list").retrieve().body(JsonNode.class);
+    }
+
+    public JsonNode workflowGet(String workflowId) {
+        return client.get().uri("/workflow/{id}", workflowId).retrieve().body(JsonNode.class);
+    }
 }

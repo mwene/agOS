@@ -401,10 +401,31 @@ Workflows are defined inline in `manifest.json` under a `"workflow"` key:
 |-------|------|----------|-------------|
 | `id` | string | yes | Unique step identifier within the workflow |
 | `agent` | string | yes | Name of the `.aapp` package to spawn as a sub-agent |
-| `timeout` | integer | no | Max seconds for the step before it is marked `TimedOut` |
+| `timeout_secs` | integer | no | Max seconds for the step before it is marked `TimedOut` |
 | `on_success` | string | no | Next step ID on success, or `__terminal__` to finish |
 | `on_failure` | string | no | Next step ID on failure (if omitted, the workflow fails) |
 | `parallel` | array | no | List of `{agent: string}` objects for parallel execution |
+| `join` | string | no | `"all"` (wait for all) or `"any"` (race) join strategy |
+| `loop_type` | string | no | `"RepeatUntil"` or `"While"` — repeat the step agent |
+| `loop_condition` | string | no | UMI-evaluated condition for loop termination |
+| `max_iterations` | integer | no | Maximum loop iterations (default 10) |
+
+### Loop Steps
+
+A loop step repeats the same agent until a condition is met (RepeatUntil) or while a condition holds (While):
+
+```json
+{
+  "id": "verify_transactions",
+  "agent": "Accountant",
+  "timeout_secs": 15,
+  "loop_type": "RepeatUntil",
+  "loop_condition": "all financial records have been verified",
+  "max_iterations": 3
+}
+```
+
+The `loop_condition` is evaluated by UMI at the end of each iteration. For `RepeatUntil`, the loop continues until the condition becomes true. For `While`, the loop continues while the condition remains true. The loop always terminates after `max_iterations`, even if the condition is never met.
 
 ### Parallel Steps
 
@@ -426,24 +447,41 @@ Workflows are defined inline in `manifest.json` under a `"workflow"` key:
 
 ### Running a Workflow
 
-```bash
-curl -X POST http://127.0.0.1:7400/workflow/run \
-  -H 'Content-Type: application/json' \
-  -d '{"name": "financial_audit", "aapps_path": "aapps"}'
-```
+Workflows follow a two-phase API: submit the definition, then execute it.
 
-Response:
-```json
-{"workflow_id": "wf-abc123", "status": "running", "current_step": "validate_balance"}
+```bash
+# 1. Submit the workflow definition
+curl -X POST http://127.0.0.1:7400/workflow/submit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "workflow": "financial_audit",
+    "steps": [
+      {"id": "validate", "agent": "Financial Auditor", "timeout_secs": 30, "on_success": "verify"},
+      {"id": "verify", "agent": "Accountant", "loop_type": "RepeatUntil", "loop_condition": "all verified", "max_iterations": 3},
+      {"id": "report", "agent": "Financial Auditor", "on_success": "__terminal__"}
+    ]
+  }'
+
+# Response includes the workflow ID
+{"ok": true, "workflow": {"id": "wf-abc123", "status": "Running", ...}}
+
+# 2. Execute the workflow by ID
+curl -X POST http://127.0.0.1:7400/workflow/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"workflow_id": "wf-abc123"}'
 ```
 
 ### Checking Status
 
 ```bash
-curl http://127.0.0.1:7400/workflow/status/wf-abc123
+# List all workflows
+curl http://127.0.0.1:7400/workflow/list
+
+# Get specific workflow details
+curl http://127.0.0.1:7400/workflow/wf-abc123
 ```
 
-The orchestrator spawns each step's agent as a child cognitive process, monitors its lifecycle, and advances through the DAG automatically.
+The orchestrator spawns each step's agent as a child cognitive process, monitors its lifecycle, executes loops with UMI condition checking, and advances through the DAG automatically.
 
 ---
 
@@ -491,6 +529,136 @@ When signature verification is enabled, the install response includes:
   "signature_valid": true,
   ...
 }
+```
+
+---
+
+## Agent Building from Templates
+
+agOS provides a **Marketplace API** for discovering, building, and recommending agents without manually creating `.aapp` directory structures.
+
+### Built-in Templates
+
+Three templates are built into the kernel:
+
+| Template | Default Token Quota | Default Priority | States | Description |
+|----------|-------------------|------------------|--------|-------------|
+| `data_analyzer` | 5000 | 2 | `analyze → __terminal__` | Analyzes data and returns structured insights |
+| `report_generator` | 8000 | 2 | `collect → generate → __terminal__` | Generates structured reports from input data |
+| `validator` | 3000 | 1 | `validate → flag → __terminal__` | Validates data against rules and constraints |
+
+List available templates:
+
+```bash
+curl http://127.0.0.1:7400/marketplace/templates
+```
+
+### Building an Agent from a Template
+
+Use `POST /marketplace/build` to create a new `.aapp` agent on disk from a template or custom spec:
+
+```bash
+curl -X POST http://127.0.0.1:7400/marketplace/build \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "MyAnalyzer",
+    "description": "Custom analyzer built from template",
+    "capabilities": ["data:analyze", "report:generate"],
+    "permissions": ["memory:page", "umi:reason"],
+    "token_quota": 5000,
+    "priority": 2,
+    "template_name": "data_analyzer"
+  }'
+```
+
+The kernel:
+1. Creates `aapps/MyAnalyzer/manifest.json` and `logic_graphs.json` from the template.
+2. Seeds the state machine from the template's default states.
+3. Creates empty `tools/` and `validation_tests/` directories.
+4. Scans the local catalog to register the new agent.
+5. Logs the event to the episodic ledger.
+6. Returns the full manifest and logic_graphs in the response.
+
+**Response:**
+```json
+{
+  "ok": true,
+  "agent": {
+    "name": "MyAnalyzer",
+    "path": "aapps/MyAnalyzer",
+    "manifest": {
+      "name": "MyAnalyzer",
+      "version": "1.0.0",
+      "description": "Custom analyzer built from template",
+      "capabilities": ["data:analyze", "report:generate"],
+      "permissions": ["memory:page", "umi:reason"],
+      "limits": {"max_tokens": 5000, "max_subagents": 3},
+      "priority": 2,
+      "goal_metric": 0.9
+    },
+    "logic_graphs": {
+      "initial_state": "start",
+      "states": {"start": {"transitions": {"complete": "__terminal__", "error": "error"}}, "error": {"transitions": {"retry": "start"}}}
+    },
+    "installed": true
+  }
+}
+```
+
+### Building a Custom Agent (No Template)
+
+Omit `template_name` and optionally provide custom `states`:
+
+```bash
+curl -X POST http://127.0.0.1:7400/marketplace/build \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "CustomProcessor",
+    "description": "Custom three-state processor",
+    "capabilities": ["process:data"],
+    "permissions": ["umi:reason"],
+    "token_quota": 3000,
+    "priority": 1,
+    "states": [
+      {"name": "ingest", "transitions": {"ready": "process"}},
+      {"name": "process", "transitions": {"done": "__terminal__", "error": "handle_error"}},
+      {"name": "handle_error", "transitions": {"retry": "ingest"}}
+    ]
+  }'
+```
+
+### Recommending Agents for a Goal
+
+The marketplace can use UMI reasoning to recommend an optimal agent workflow for a given goal:
+
+```bash
+curl -X POST http://127.0.0.1:7400/marketplace/recommend \
+  -H 'Content-Type: application/json' \
+  -d '{"goal": "Audit the financial records for Q1 and generate a compliance report"}'
+```
+
+The kernel:
+1. Lists all available agents from the catalog.
+2. Constructs a prompt with the goal and the full agent catalog.
+3. Calls UMI reasoning to design a multi-step workflow.
+4. Returns recommended steps with confidence scores, alternatives, and a runnable workflow definition.
+
+### Discovering Agents in the Marketplace
+
+```bash
+# List all agents
+curl http://127.0.0.1:7400/marketplace/list
+
+# Search by capability
+curl -X POST http://127.0.0.1:7400/marketplace/search \
+  -H 'Content-Type: application/json' \
+  -d '{"capability": "financial", "has_workflow": true}'
+
+# Get details for a specific agent
+curl http://127.0.0.1:7400/marketplace/agent/Financial%20Auditor
+
+# Re-scan the local aapps/ directory
+curl -X POST http://127.0.0.1:7400/marketplace/scan
 ```
 
 ---
@@ -698,6 +866,15 @@ The PID may have been terminated (panic, quota exhaustion, or explicit kill). Us
 | `GET` | `/memory/stats` | Memory statistics |
 | `GET` | `/scheduler/policy` | Get current scheduler policy |
 | `POST` | `/scheduler/policy` | Change scheduler policy |
-| `POST` | `/workflow/run` | Run a sub-agent workflow from a .aapp package |
-| `GET` | `/workflow/status/{id}` | Get workflow execution status |
+| `POST` | `/workflow/submit` | Submit a workflow definition programmatically |
+| `POST` | `/workflow/execute` | Execute a submitted workflow by ID |
+| `GET` | `/workflow/list` | List all workflow instances |
+| `GET` | `/workflow/{id}` | Get workflow instance details |
 | `POST` | `/security/audit/export` | Export audit log to stdout/file/S3 |
+| `GET` | `/marketplace/list` | List all agents in the marketplace |
+| `POST` | `/marketplace/search` | Search agents by query, capability, priority, workflow |
+| `GET` | `/marketplace/agent/{name}` | Get agent listing by name |
+| `POST` | `/marketplace/scan` | Re-scan local aapps/ directory |
+| `GET` | `/marketplace/templates` | List built-in agent templates |
+| `POST` | `/marketplace/build` | Build a new .aapp agent from template or custom spec |
+| `POST` | `/marketplace/recommend` | Recommend agents for a goal via UMI reasoning |

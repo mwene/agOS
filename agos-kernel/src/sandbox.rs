@@ -118,6 +118,106 @@ impl AAppLoader {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AAppInstance {
+    pub name: String,
+    pub path: String,
+    pub manifest: Value,
+    pub logic_graphs: Value,
+    pub tools: HashMap<String, Value>,
+    pub workflow: Option<WorkflowDefinition>,
+    pub process: Option<AAppProcessHandle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AAppProcessHandle {
+    pub pid: String,
+    pub status: String,
+}
+
+pub struct AAppBuilder;
+
+impl AAppBuilder {
+    pub fn from_template(
+        name: &str,
+        description: &str,
+        capabilities: Vec<String>,
+        permissions: Vec<String>,
+        token_quota: u64,
+        template_path: &std::path::Path,
+    ) -> Result<Value, String> {
+        let pkg = AAppLoader::load_from_path(template_path)?;
+
+        let mut manifest = pkg.manifest.clone();
+        if let Some(obj) = manifest.as_object_mut() {
+            obj.insert("name".to_string(), Value::String(name.to_string()));
+            obj.insert("description".to_string(), Value::String(description.to_string()));
+            if !capabilities.is_empty() {
+                obj.insert(
+                    "capabilities".to_string(),
+                    Value::Array(capabilities.iter().map(|c| Value::String(c.clone())).collect()),
+                );
+            }
+            if !permissions.is_empty() {
+                obj.insert(
+                    "permissions".to_string(),
+                    Value::Array(permissions.iter().map(|p| Value::String(p.clone())).collect()),
+                );
+            }
+            if let Some(limits) = obj.get_mut("limits") {
+                if let Some(limits_obj) = limits.as_object_mut() {
+                    limits_obj.insert(
+                        "max_tokens".to_string(),
+                        Value::Number(serde_json::Number::from(token_quota)),
+                    );
+                }
+            }
+        }
+        Ok(manifest)
+    }
+
+    pub fn create_standalone(
+        name: &str,
+        description: &str,
+        capabilities: Vec<String>,
+        permissions: Vec<String>,
+        token_quota: u64,
+        states: Option<Value>,
+        tools: Option<HashMap<String, Value>>,
+    ) -> (Value, Value, HashMap<String, Value>) {
+        let manifest = serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "description": description,
+            "capabilities": capabilities,
+            "permissions": permissions,
+            "limits": {
+                "max_tokens": token_quota,
+                "max_subagents": 3
+            },
+            "priority": 1,
+            "goal_metric": 0.9,
+        });
+
+        let logic_graphs = states.unwrap_or_else(|| {
+            let mut transitions = std::collections::HashMap::new();
+            transitions.insert("complete".to_string(), "__terminal__".to_string());
+            serde_json::json!({
+                "initial_state": "start",
+                "states": {
+                    "start": {
+                        "transitions": transitions
+                    }
+                }
+            })
+        });
+
+        let tools = tools.unwrap_or_default();
+
+        (manifest, logic_graphs, tools)
+    }
+}
+
 fn verify_aapp_signature(path: &std::path::Path) -> Option<bool> {
     let sig_path = path.join("signature.sig");
     if !sig_path.exists() {

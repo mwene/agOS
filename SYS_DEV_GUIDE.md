@@ -56,7 +56,9 @@ This guide covers the internal architecture, module interfaces, concurrency mode
 │     ├── uri.rs           ────── UnifiedRoboticsInterface (feature: uri)
 │     ├── controller.rs    ────── ControllerManager (feature: uri)
 │     ├── embodiment.rs    ────── EmbodimentLayer (feature: embodiment)
-│     ├── orchestrator.rs  ────── SubAgentOrchestrator
+    │     ├── orchestrator.rs  ────── SubAgentOrchestrator (loops, parallel, submit/execute API)
+    │     ├── marketplace.rs   ────── AgentMarketplace (catalog, search, templates, build, recommend)
+    │     ├── governance.rs    ────── ContractEngine (contracts, compliance, policies, audit)
     │     ├── audit_export.rs  ────── AuditExporter trait + impls
     │     └── panic_log        ────── RwLock<Vec<PanicLog>>
     │
@@ -69,7 +71,9 @@ This guide covers the internal architecture, module interfaces, concurrency mode
           ├── /security/*       (3 endpoints, +1 export)
           ├── /umi/*            (6 endpoints)
           ├── /sandbox/*        (3+1 endpoints, +1 with wasm-sandbox)
-          ├── /workflow/*       (2 endpoints)
+          ├── /workflow/*       (4 endpoints: submit, execute, list, :id)
+          ├── /marketplace/*    (7 endpoints: list, search, agent, scan, templates, build, recommend)
+          ├── /governance/*     (8 endpoints: contract create/get/list/remove, compliance, audit, policy create/list)
       ├── /embodiment/*     (8 endpoints, feature: embodiment)
       ├── /uri/*            (10 endpoints, feature: uri)
       ├── /controller/*     (17 endpoints, feature: uri)
@@ -104,28 +108,28 @@ Each kernel subsystem is an independent struct that is composed into `agOSKernel
 ## Module Dependency Graph
 
 ```
-                    ┌─────────────┐
-                    │   kernel    │
-                    │ (agOSKernel)│
-                    └──┬──┬──┬──┬─┘
-          ┌────────────┘  │  │  └──────────────┐
-          │               │  │                 │
-          ▼               ▼  ▼                 ▼
-    ┌─────────┐    ┌──────────┐    ┌────────────┐
-    │scheduler│    │  memory  │    │  security  │
-    └─────────┘    └──────────┘    └────────────┘
+                    ┌──────────────────┐
+                    │     kernel       │
+                    │  (agOSKernel)    │
+                    └──┬──┬──┬──┬──┬──┬─┘
+          ┌────────────┘  │  │  │  │  └──────────────┐
+          │               │  │  │  │                 │
+          ▼               ▼  ▼  ▼  ▼                 ▼
+    ┌─────────┐    ┌──────────┐    ┌─────────────┐
+    │scheduler│    │  memory  │    │  security   │
+    └─────────┘    └──────────┘    └─────────────┘
                           │
-          ┌───────────────┼───────────────┐
-          │               │               │
-          ▼               ▼               ▼
-    ┌─────────┐    ┌──────────┐    ┌────────────┐
-    │  cipc   │    │   umi    │    │  sandbox   │
-    └─────────┘    └──────────┘    └────────────┘
-                          │
-                          ▼
-                    ┌──────────┐
-                    │  grid    │  ← always compiled, no feature gate
-                    └──────────┘
+          ┌───────────────┼───────────────┬───────────────┐
+          │               │               │               │
+          ▼               ▼               ▼               ▼
+    ┌─────────┐    ┌──────────┐    ┌────────────┐  ┌──────────────┐
+    │  cipc   │    │   umi    │    │  sandbox   │  │marketplace  │
+    └─────────┘    └──────────┘    └────────────┘  └──────────────┘
+                          │                               │
+                          ▼                               ▼
+                    ┌──────────┐              ┌──────────────┐
+                    │  grid    │              │ governance   │
+                    └──────────┘              └──────────────┘
                     ┌──────────┐
                     │DriverState│
                     │ (statics) │
@@ -913,13 +917,13 @@ cargo test -- grid
 
 ### orchestrator.rs — SubAgentOrchestrator
 
-The Orchestrator manages **workflow DAGs** defined in `.aapp` packages. Each workflow consists of sequential and/or parallel steps, each of which spawns a sub-agent (another `.aapp` process).
+The Orchestrator manages **workflow DAGs** with support for sequential steps, parallel execution, and **loop steps** (RepeatUntil / While). Workflows can be submitted via API (ad-hoc definitions) or loaded from `.aapp` packages.
 
 #### Internal State
 
 ```rust
 pub struct SubAgentOrchestrator {
-    workflows: Mutex<HashMap<String, WorkflowInstance>>,
+    workflows: RwLock<Vec<WorkflowInstance>>,
 }
 ```
 
@@ -928,18 +932,45 @@ pub struct SubAgentOrchestrator {
 ```rust
 pub struct WorkflowInstance {
     pub id: String,
-    pub definition: WorkflowDefinition,
-    pub status: WorkflowStatus,
-    pub current_step: String,
-    pub steps: HashMap<String, StepInstance>,
+    pub name: String,
+    pub status: WorkflowStatus,         // Running, Completed, Failed(String), TimedOut
+    pub current_step: Option<String>,
+    pub step_results: HashMap<String, WorkflowStepResult>,
     pub created_at: String,
+    pub updated_at: String,
+    pub definition: Option<WorkflowDefinition>,  // stored for API-submitted workflows
 }
 
-pub struct StepInstance {
-    pub status: StepStatus,            // Pending, Running, Succeeded, Failed, TimedOut
-    pub child_pid: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
+pub struct WorkflowStepResult {
+    pub step_id: String,
+    pub agent: String,
+    pub status: String,
+    pub pid: Option<String>,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
+}
+```
+
+#### WorkflowStep (DSL)
+
+```rust
+pub struct WorkflowStep {
+    pub id: String,
+    pub agent: String,
+    pub timeout_secs: Option<u64>,
+    pub on_success: Option<String>,
+    pub on_failure: Option<String>,
+    pub parallel: Option<Vec<WorkflowStep>>,
+    pub join: Option<String>,
+    pub loop_type: Option<LoopType>,        // RepeatUntil or While
+    pub loop_condition: Option<String>,      // evaluated by UMI
+    pub max_iterations: Option<u32>,          // default 10
+}
+
+pub enum LoopType {
+    RepeatUntil,
+    While,
 }
 ```
 
@@ -947,27 +978,235 @@ pub struct StepInstance {
 
 | Method | Locking | Description |
 |--------|---------|-------------|
-| `create_workflow(def)` | Mutex write | Creates instance, validates DAG, sets initial step |
-| `advance_workflow(id, step_id, result)` | Mutex write | Advances to next step based on on_success/on_failure |
-| `get_status(id)` | Mutex read | Returns full instance details |
-| `list_workflows()` | Mutex read | Returns all instances |
-| `fail_workflow(id)` | Mutex write | Marks workflow as failed, cleans up children |
+| `submit_workflow_definition(def)` | RwLock write | Creates instance from API definition, stores definition in instance |
+| `execute_workflow(id, kernel)` | RwLock read | Finds instance, loads steps (from filesystem or stored definition), runs DAG |
+| `execute_steps(name, steps, kernel)` | — | Iterates steps: loop steps go to `execute_loop_step`, parallel to tokio `join_all`, sequential to `spawn_process` |
+| `execute_loop_step(workflow, step, kernel)` | — | Runs agent in a loop up to `max_iterations`, evaluates `loop_condition` via UMI between iterations |
+| `check_condition(condition, kernel)` | — | Calls `umi.reason` to evaluate condition string, returns bool |
+| `list_workflows()` | RwLock read | Returns all workflow instances |
+| `get_workflow(id)` | RwLock read | Returns single instance by ID |
 
-#### DSL Parsing
+#### Loop Execution
 
-Workflows are parsed from `manifest.json` by `AAppLoader` in `sandbox.rs`. The DSL is a JSON array of steps, each supporting:
-- `id` — step identifier
-- `agent` — `.aapp` name to spawn
-- `timeout` — seconds before forced failure
-- `on_success` / `on_failure` — next step transitions
-- `parallel` — list of `{agent}` for concurrent execution
-- `join` — `"all"` or `"any"`
+Loop steps repeat the same agent until a condition is met. The orchestrator:
+
+1. Spawns the agent as a sub-process (same manifest each iteration).
+2. After each iteration, calls `umi.reason` with the condition string.
+3. For `RepeatUntil`, continues if condition is false; for `While`, continues if condition is true.
+4. Always stops after `max_iterations`, regardless of condition.
+
+This enables patterns like "retry verification up to 3 times" or "audit while discrepancies remain".
+
+#### Definition Fallback
+
+When `execute_workflow` is called:
+1. It first checks `aapps/{name}/logic_graphs.json` for a `steps` array (filesystem-based workflows from `.aapp` packages).
+2. If no filesystem DSL exists, it falls back to the `definition` field stored on the `WorkflowInstance` (API-submitted workflows).
+3. This dual path enables both `.aapp`-bundled workflows and ad-hoc API-submitted workflows.
 
 #### Integration with Kernel
 
 The kernel orchestrator is called from workflow REST handlers:
-1. `POST /workflow/run` — loads the `.aapp`, checks for a `workflow` field in the manifest, creates a `WorkflowInstance`, and spawns the first step.
-2. `GET /workflow/status/:id` — reads current state from the orchestrator.
+1. `POST /workflow/submit` — accepts a `WorkflowDefinition` JSON body, creates a `WorkflowInstance` and returns it.
+2. `POST /workflow/execute` — accepts `{workflow_id}`, loads the definition, runs `execute_steps`.
+3. `GET /workflow/list` — returns all instances via `list_workflows`.
+4. `GET /workflow/{id}` — returns a single instance via `get_workflow`.
+
+---
+
+### marketplace.rs — AgentMarketplace
+
+The Marketplace provides agent discovery, cataloging, template-based building, and goal→workflow recommendation. It uses `Mutex<HashMap>` for thread-safe access to the agent registry and templates.
+
+#### Internal State
+
+```rust
+pub struct AgentMarketplace {
+    registry: Mutex<HashMap<String, AgentListing>>,
+    templates: Mutex<HashMap<String, AgentTemplate>>,
+}
+```
+
+**AgentListing** stores metadata for each discovered agent:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Agent name from manifest |
+| `version` | string | Semantic version |
+| `description` | string | Purpose of the agent |
+| `capabilities` | string[] | Capability tags from manifest |
+| `permissions` | string[] | Required permissions |
+| `token_quota` | u64 | Max tokens per run |
+| `priority` | u32 | Scheduling priority |
+| `has_workflow` | bool | Whether the agent defines a workflow |
+| `states` | usize | Number of state machine states |
+| `tool_count` | usize | Number of tool schemas |
+| `source` | string | Origin (e.g. "local") |
+| `installed` | bool | Whether the agent is installed |
+
+#### Key Methods
+
+| Method | Thread Safety | Description |
+|--------|--------------|-------------|
+| `scan_local(aapps_path)` | Mutex write | Reads all `.aapp` directories, creates `AgentListing` from each manifest, populates registry |
+| `list_agents()` | Mutex read | Returns all registered agents, sorted by name |
+| `get_agent(name)` | Mutex read | Returns a single agent by name |
+| `search_agents(query)` | Mutex read | Filters by text query, capability, priority range, workflow flag; limits to 20 results |
+| `list_templates()` | Mutex read | Returns all built-in template infos |
+| `build_agent(request, aapps_path, kernel)` | Mutex write (indirect) | Creates `.aapp` directory, writes manifest.json + logic_graphs.json, creates empty tools/ and validation_tests/ dirs, rescans local, logs to episodic ledger |
+| `recommend_agents(goal, kernel)` | Async, Mutex read | Lists available agents, constructs UMI prompt, parses response into `AgentRecommendation` with workflow steps |
+
+#### Built-in Templates
+
+Three templates are compiled into `init_templates()`: `data_analyzer` (2 states, 5000 tokens), `report_generator` (2 states, 8000 tokens), `validator` (2 states, 3000 tokens). Templates provide default permissions, token quotas, priority, and state machine definitions. Custom `states` in a build request override template defaults.
+
+#### AgentListing.from_aapp_path
+
+This function reads an `.aapp` directory and extracts metadata:
+1. Loads `AAppPackage` via `AAppLoader::load_from_path`.
+2. Extracts `description`, `capabilities`, `limits.max_tokens`, `priority`, `version`, `permissions` from manifest.
+3. Counts states from `logic_graphs.json` (if present).
+4. Populates `AgentListing` with sensible defaults for missing fields.
+
+#### Goal→Workflow Recommendation
+
+`recommend_agents` uses the UMI layer for reasoning:
+1. Collects all available agents as a text catalog.
+2. Builds a prompt with the user's goal and the agent catalog.
+3. Calls `umi.reason` with the structured prompt.
+4. Parses the `|`-delimited output into `RecommendedStep` entries.
+5. Chains steps via `on_success` and returns a complete `WorkflowDefinition`.
+
+**Locking note:** `Mutex` is sufficient because marketplace operations are fast (registry operations are hash lookups, file I/O is done outside the lock). The async `recommend_agents` only acquires the lock to read the registry, not during the UMI call.
+
+#### REST Endpoints
+
+| Method | Path | Handler |
+|--------|------|---------|
+| `GET` | `/marketplace/list` | `marketplace_list` |
+| `POST` | `/marketplace/search` | `marketplace_search` |
+| `GET` | `/marketplace/agent/{name}` | `marketplace_get_agent` |
+| `POST` | `/marketplace/scan` | `marketplace_scan` |
+| `GET` | `/marketplace/templates` | `marketplace_templates` |
+| `POST` | `/marketplace/build` | `marketplace_build` |
+| `POST` | `/marketplace/recommend` | `marketplace_recommend` |
+
+---
+
+### governance.rs — ContractEngine
+
+The Governance subsystem provides compliance checking through **governance contracts** — declarative rules, limits, and success criteria that are evaluated against agent instances. The `ContractEngine` manages contracts, policies, and an audit log.
+
+#### Internal State
+
+```rust
+pub struct ContractEngine {
+    contracts: Mutex<HashMap<String, GovernanceContract>>,
+    policies: Mutex<HashMap<String, GovernancePolicy>>,
+    audit_log: Mutex<Vec<ComplianceReport>>,
+}
+```
+
+#### GovernanceContract
+
+```rust
+pub struct GovernanceContract {
+    pub contract_id: String,           // UUID v4
+    pub name: String,
+    pub description: String,
+    pub rules: Vec<ContractRule>,       // compliance rules
+    pub limits: ContractLimits,         // resource/permission limits
+    pub success_criteria: SuccessCriteria, // success conditions
+    pub created_by: String,
+}
+```
+
+**ContractRule:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `field` | string | Dot-separated manifest path (e.g. `limits.max_tokens`) |
+| `operator` | string | `"eq"`, `"lt"`, `"gt"`, `"contains"` |
+| `value` | Value | Expected or threshold value |
+
+**ContractLimits:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `max_tokens_per_run` | u64? | Max total token consumption |
+| `max_subagents` | u32? | Max child processes |
+| `max_execution_seconds` | u64? | Max wall-clock time |
+| `max_memory_pages` | u32? | Max Vector RAM pages |
+| `allowed_permissions` | string[]? | Allowlist for permission scopes |
+
+**SuccessCriteria:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `min_goal_metric` | f64? | Minimum goal_metric threshold |
+| `required_output_fields` | string[]? | Required output fields |
+| `min_steps_completed` | u32? | Minimum completed steps |
+| `no_error_states` | bool? | Reject any error state |
+
+#### Compliance Checking
+
+`check_compliance(instance: &AAppInstance) -> ComplianceReport`:
+
+1. **Rules evaluation**: For each rule, navigates the manifest via dot-separated path, extracts the value, and compares using the specified operator (`eq`, `lt`, `gt`, `contains`).
+2. **Limits checking**: Compares manifest values against contract limits for tokens, subagents, and permissions.
+3. **Report generation**: Returns `ComplianceReport` with `contract_id`, `contract_name`, `agent_name`, `compliant: bool`, `violations: Vec<String>`, and `timestamp`.
+
+#### Key Methods
+
+| Method | Thread Safety | Description |
+|--------|--------------|-------------|
+| `register_contract(contract)` | Mutex write | Adds contract to registry, rejects duplicates |
+| `get_contract(id)` | Mutex read | Returns contract by ID |
+| `list_contracts()` | Mutex read | Returns all contracts sorted by name |
+| `remove_contract(id)` | Mutex write | Removes contract, returns success |
+| `check_agent_compliance(instance)` | Mutex read/write | Runs compliance against all contracts, logs report |
+| `get_audit_log(limit)` | Mutex read | Returns last N compliance reports |
+| `get_compliance_summary()` | Mutex read | Aggregates checks, compliant/violation counts, top violations |
+| `create_policy(name, desc, contract_ids)` | Mutex write | Creates a policy bundling multiple contracts |
+| `list_policies()` | Mutex read | Returns all policies sorted by name |
+
+#### ComplianceReport
+
+```rust
+pub struct ComplianceReport {
+    pub contract_id: String,
+    pub contract_name: String,
+    pub agent_name: String,
+    pub compliant: bool,
+    pub violations: Vec<String>,
+    pub timestamp: String,           // RFC 3339
+}
+```
+
+#### ComplianceSummary
+
+```rust
+pub struct ComplianceSummary {
+    pub total_contracts: usize,
+    pub total_checks: usize,
+    pub compliant_checks: usize,
+    pub violation_checks: usize,
+    pub top_violations: Vec<(String, usize)>,  // violation text → count, top 10
+}
+```
+
+#### REST Endpoints
+
+| Method | Path | Handler |
+|--------|------|---------|
+| `POST` | `/governance/contract/create` | `governance_contract_create` |
+| `GET` | `/governance/contract/{id}` | `governance_contract_get` |
+| `GET` | `/governance/contracts` | `governance_contracts` |
+| `POST` | `/governance/contract/{id}/remove` | `governance_contract_remove` |
+| `GET` | `/governance/compliance` | `governance_compliance_summary` |
+| `GET` | `/governance/audit` | `governance_audit_log` |
+| `POST` | `/governance/policy/create` | `governance_policy_create` |
+| `GET` | `/governance/policies` | `governance_policies` |
 
 ---
 
@@ -1467,7 +1706,21 @@ mod tests {
 
 ### Integration Test (via Demo)
 
-The integration test is the 28-step Java `DemoOrchestrator`. It exercises every REST endpoint and verifies responses:
+The integration test is the Java `DemoOrchestrator`. It exercises REST endpoints across 13 phases (P1–P10 + UMI hot-swap) and verifies responses:
+
+| Phase | Steps | What It Covers |
+|-------|-------|----------------|
+| P1 | 3 | Kernel health, UMI driver registration, active driver |
+| P2 | 2 | `.aapp` installation (Financial Auditor, Accountant) |
+| P3 | 3 | Process spawn, scheduler verification |
+| P4 | 5 | UMI reason, L1 write, L2 compress, vector embed, page-in |
+| P5 | 3 | cIPC route, response, history verification |
+| UMI | 3 | Hot-swap, cloud reasoning, restore |
+| P6 | 4 | Ring 0 ALLOW/DENY, kernel panic, L1 flush |
+| P7 | 2 | Episodic ledger, audit log |
+| P8 | 3 | Memory stats, UMI metrics, process listing |
+| P9 | 17 | Robotic agents (Waiter/Chef/Supervisor), URI sensors, PID, trajectory, safety, E-Stop |
+| P10 | 4 | Workflow submit with loop step, execute, list, get |
 
 ```bash
 # Terminal 1
@@ -1479,7 +1732,7 @@ curl -X POST http://127.0.0.1:8080/api/demo/run
 curl http://127.0.0.1:8080/api/demo/status
 ```
 
-All 28 steps must pass with no failures. The demo is the CI gate.
+All steps must pass with no failures. The demo is the CI gate.
 
 ---
 
