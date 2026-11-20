@@ -10,7 +10,7 @@
 
 **Alpha — a working system, not a research prototype.** All thirteen kernel phases are implemented: ~9,500 lines of Rust, 100+ REST endpoints, and 50 passing tests (`cargo test`). That covers the cognitive scheduler, hierarchical memory and cIPC bus, Ring 0 policy layer, `.aapp` packaging and signing, workflow orchestration, governance, structured audit export, and the HTTP API.
 
-Model inference sits behind the UMI driver boundary. The repository ships two deterministic stub drivers so the kernel can be built and tested offline; production drivers are registered at runtime via `POST /umi/driver/register` or by implementing the driver trait. Per-subsystem status is tracked in `FEATURES_GUIDE.md`.
+Model inference sits behind the UMI driver boundary. Two deterministic stub drivers keep tests and offline builds reproducible, and a live driver for any OpenAI-compatible endpoint (OpenAI, DeepSeek, Ollama, vLLM, LM Studio) activates from environment configuration — see [Model Drivers (UMI)](#model-drivers-umi).
 
 ---
 
@@ -153,6 +153,60 @@ Open `http://127.0.0.1:8080` in a browser and click **Run Full Demo**.
 curl -X POST http://127.0.0.1:8080/api/demo/run
 curl http://127.0.0.1:8080/api/demo/status
 ```
+
+---
+
+## Model Drivers (UMI)
+
+The kernel reaches models through the Unified Model Interface. Two deterministic stub drivers are always available (`LocalEngine-v0`, `CloudGPT-HighReason`) so tests and offline demos are reproducible. A live driver for any OpenAI-compatible Chat Completions API — OpenAI, DeepSeek, Groq, Together, vLLM, LM Studio, or Ollama's `/v1` layer — is enabled by configuration:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `AGOS_LLM_BASE_URL` | API root | `https://api.openai.com/v1` |
+| `AGOS_LLM_API_KEY` | Bearer token (omit for local runtimes) | none |
+| `AGOS_LLM_MODEL` | Model name | `gpt-4o-mini` |
+| `AGOS_LLM_TIMEOUT_SECS` | Per-request timeout | `60` |
+| `AGOS_LLM_MAX_TOKENS` | `max_tokens` sent to the provider | provider default |
+| `AGOS_LLM_TEMPERATURE` | Sampling temperature | provider default |
+
+`OPENAI_BASE_URL` / `OPENAI_API_KEY` are accepted as fallbacks. When no base URL or key is set, the live driver stays disabled.
+
+```bash
+# Cloud
+export AGOS_LLM_BASE_URL="https://api.deepseek.com/v1"
+export AGOS_LLM_API_KEY="sk-..."
+export AGOS_LLM_MODEL="deepseek-chat"
+
+# Or local (no key required)
+export AGOS_LLM_BASE_URL="http://localhost:11434/v1"
+export AGOS_LLM_MODEL="llama3.1"
+
+cd agos-kernel && cargo run --release
+```
+
+Route UMI traffic to the live driver and verify token accounting from the provider's `usage` block:
+
+```bash
+curl -X POST http://127.0.0.1:7400/umi/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"driver_name": "OpenAICompatible"}'
+
+curl -X POST http://127.0.0.1:7400/umi/reason \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt_vector": ["You are a terse assistant.", "Name the capital of Kenya."]}'
+
+curl http://127.0.0.1:7400/umi/metrics
+```
+
+If the provider returns an error, `/umi/reason` reports `"mode": "UMI_ERROR"` with an `error` field instead of failing the request. Configuration can also be changed at runtime without a restart:
+
+```bash
+curl -X POST http://127.0.0.1:7400/umi/driver/config/OpenAICompatible \
+  -H 'Content-Type: application/json' \
+  -d '{"config": {"model": "gpt-4o", "timeout_secs": "30"}}'
+```
+
+See [UMI_DRIVER_GUIDE.md](UMI_DRIVER_GUIDE.md) for the driver contract, prompt mapping, and how to add a non-OpenAI protocol.
 
 ---
 
@@ -425,7 +479,7 @@ The demo walks through all core agOS capabilities in steps across 13 phases:
 | Structured Audit Export | ✓ Complete |
 | Persistent Storage (SQLite) | Planned |
 | Rate Limiting and QoS | Planned |
-| Token Accounting with Real Models | Planned |
+| Token Accounting with Real Models | ✓ Complete (live OpenAI-compatible driver) |
 
 ---
 

@@ -131,7 +131,7 @@ curl http://127.0.0.1:7400/umi/metrics
 
 - Drivers are `static` items, not heap-allocated — zero-cost dispatch, no vtable.
 - All `DriverState` fields must be `const`-compatible (no `String`, no `Vec`).
-- Deterministic stubs by default — plug in real model APIs per the [UMI Driver Guide](UMI_DRIVER_GUIDE.md).
+- Deterministic stubs by default; a live OpenAI-compatible driver (`src/llm.rs`) activates from `AGOS_LLM_*` environment variables. See the [UMI Driver Guide](UMI_DRIVER_GUIDE.md).
 
 ---
 
@@ -957,20 +957,24 @@ cargo test --features "z3-solver,wasm-sandbox,embodiment,uri"
 
 ---
 
-### Token Accounting with Real Models
+### Token Accounting with Real Models (Completed)
 
-**Motivation**: The current UMI stub drivers use synthetic token counts (`prompt.len() * token_cost`). Real model APIs (OpenAI, Anthropic, Ollama) return actual token usage.
+**Motivation**: The deterministic stub drivers use synthetic token counts (`prompt.len() * token_cost`). Real model APIs return actual usage in the response body, which is what budget enforcement needs.
 
-**Implementation**: In each real driver's `reason()`:
+**What Was Built**: `agos-kernel/src/llm.rs` implements an OpenAI-compatible driver. It reads `usage.total_tokens` (falling back to `prompt_tokens + completion_tokens`) and only estimates from character counts when a provider omits usage entirely:
+
 ```rust
-let usage = resp.get("usage").ok_or("no usage")?;
-let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
-let completion_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
-let total = prompt_tokens + completion_tokens;
-d.total_tokens.fetch_add(total, Ordering::Relaxed);
+let tokens_from_api = parsed.usage.and_then(|usage| {
+    usage.total_tokens.or_else(|| match (usage.prompt_tokens, usage.completion_tokens) {
+        (Some(prompt), Some(completion)) => Some(prompt + completion),
+        _ => None,
+    })
+});
 ```
 
-**Files**: `agos-kernel/src/umi.rs` — individual driver `reason()` implementations.
+Counters are exposed through `GET /umi/metrics` and are surfaced per driver in `GET /umi/drivers`.
+
+**Files**: `agos-kernel/src/llm.rs`, wired into `agos-kernel/src/umi.rs`.
 
 ---
 
@@ -1308,7 +1312,7 @@ curl http://127.0.0.1:7400/governance/audit
 | Feature | Effort | Impact | Dependencies | Status |
 |---------|--------|--------|-------------|--------|
 | Persistent Storage (SQLite) | 2 days | High — data survives restart | None | Planned |
-| Token Accounting with Real Models | 1 day | High — accurate budgeting | UMI drivers (existing) | Planned |
+| Token Accounting with Real Models | 1 day | High — accurate budgeting | UMI drivers (existing) | ✓ Implemented |
 | Rate Limiting and QoS | 1 day | Medium — production hardening | None | Planned |
 | Pluggable Scheduler Policies | 3 days | Medium — scheduling flexibility | None | Planned |
 | Secure .aapp Signing | 2 days | Medium — supply chain security | None | ✓ Implemented |

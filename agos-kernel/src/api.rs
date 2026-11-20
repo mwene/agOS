@@ -477,12 +477,16 @@ async fn umi_reason(
         return resp;
     }
     let result = kernel.umi.reason(&req.prompt_vector, &Value::Null).await;
-    Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "output": result.output,
         "tokens_used": result.tokens_used,
         "model": result.model,
         "mode": result.mode,
-    }))
+    });
+    if let Some(error) = result.error {
+        payload["error"] = serde_json::Value::String(error);
+    }
+    Json(payload)
 }
 
 #[derive(Deserialize)]

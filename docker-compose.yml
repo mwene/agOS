@@ -8,6 +8,11 @@ services:
       - "7400:7400"
     environment:
       RUST_LOG: info
+      # Live model driver (optional). Empty values keep the deterministic
+      # built-in drivers active. See UMI_DRIVER_GUIDE.md.
+      AGOS_LLM_BASE_URL: ${AGOS_LLM_BASE_URL:-}
+      AGOS_LLM_API_KEY: ${AGOS_LLM_API_KEY:-}
+      AGOS_LLM_MODEL: ${AGOS_LLM_MODEL:-}
     volumes:
       - agos-data:/var/lib/agos/data
       - ./agos-kernel/aapps:/var/lib/agos/aapps:ro

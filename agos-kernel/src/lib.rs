@@ -3,6 +3,7 @@ pub mod models;
 pub mod memory;
 pub mod cipc;
 pub mod security;
+pub mod llm;
 pub mod umi;
 pub mod sandbox;
 pub mod kernel;

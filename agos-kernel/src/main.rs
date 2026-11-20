@@ -35,7 +35,14 @@ async fn main() {
     let kernel = Arc::new(agOSKernel::new(umi, addr, db_path));
 
     tracing::info!(
-        "UMI drivers ready: LocalEngine-v0 (cap 2), CloudGPT-HighReason (cap 5)"
+        "UMI drivers ready: {}",
+        kernel
+            .umi
+            .list_drivers()
+            .iter()
+            .map(|d| format!("{} (cap {}, {})", d.name, d.capability_level, d.driver_type))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     {
