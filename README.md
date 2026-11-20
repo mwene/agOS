@@ -6,6 +6,14 @@
 
 ---
 
+## Project Status
+
+**Alpha — a working system, not a research prototype.** All thirteen kernel phases are implemented: ~9,500 lines of Rust, 100+ REST endpoints, and 50 passing tests (`cargo test`). That covers the cognitive scheduler, hierarchical memory and cIPC bus, Ring 0 policy layer, `.aapp` packaging and signing, workflow orchestration, governance, structured audit export, and the HTTP API.
+
+Model inference sits behind the UMI driver boundary. The repository ships two deterministic stub drivers so the kernel can be built and tested offline; production drivers are registered at runtime via `POST /umi/driver/register` or by implementing the driver trait. Per-subsystem status is tracked in `FEATURES_GUIDE.md`.
+
+---
+
 ## Architecture
 
 ```
