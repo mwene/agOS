@@ -31,6 +31,7 @@ export AGOS_LLM_API_KEY="sk-..."                       # omit for local runtimes
 export AGOS_LLM_MODEL="gpt-4o-mini"
 export AGOS_LLM_EMBEDDING_MODEL="text-embedding-3-small"  # optional, for /umi/embed
 export AGOS_LLM_TIMEOUT_SECS="60"
+export AGOS_LLM_STREAM_IDLE_TIMEOUT_SECS="30"  # optional, for /umi/reason/stream
 export AGOS_LLM_MAX_TOKENS="1024"                      # optional
 export AGOS_LLM_TEMPERATURE="0.2"                      # optional
 ```
@@ -146,6 +147,64 @@ an embedding model the endpoint returns `UMI_ERROR` rather than silently mixing
 deterministic vectors with provider vectors. The deterministic drivers return
 16-dimensional unit vectors derived from a stable hash.
 
+## Streaming
+
+`POST /umi/reason/stream` streams server-sent events instead of buffering the
+whole completion. The request body is the same as `/umi/reason`, plus optional
+stream controls:
+
+```json
+{
+  "prompt_vector": ["Write a short haiku."],
+  "schema": null,
+  "token_budget": 40,
+  "idle_timeout_secs": 15
+}
+```
+
+The response is `text/event-stream`:
+
+```
+event: delta
+data: {"delta":"An old silent pond"}
+
+event: delta
+data: {"delta":"..."}
+
+event: done
+data: {"text":"...","output":["..."],"tokens_used":12,"model":"gpt-4o-mini",
+       "mode":"SYS_REASON","finish_reason":"stop","chunks":8}
+```
+
+- `delta` events carry raw text fragments. Concatenating them in order yields
+  the full completion. In JSON mode the fragments are partial JSON — accumulate
+  first, parse once the `done` event arrives.
+- `done` carries the complete result, including `aborted` when a cut-off fired.
+- `error` carries `{"error": "..."}` and terminates the stream. Once the status
+  line is sent, failures can only be reported as events, not HTTP status codes.
+
+Cut-offs:
+
+- **Idle timeout.** If the provider sends no bytes for `AGOS_LLM_STREAM_IDLE_TIMEOUT_SECS`
+  (or `idle_timeout_secs` on the request), the call fails with `model stream
+  stalled`. There is no total-duration timeout: long generations are expected.
+- **Token budget.** When `token_budget` is set and the accumulated output
+  estimate exceeds it, the kernel drops the connection and returns the partial
+  text with `"aborted": "token_budget"`. The budget is an estimate (characters ÷ 4)
+  until the provider's final `usage` chunk arrives; it stops overspend early
+  rather than reconciling it after the fact.
+
+If the client disconnects, the next `delta` send fails, the callback returns
+`false`, and the driver drops the provider connection instead of burning tokens
+on output nobody will read (`aborted: "client_closed"` internally, though the
+client is gone by then).
+
+The driver asks providers for a final usage chunk with
+`stream_options: {"include_usage": true}`. Not every runtime supports it; when
+absent, token counts fall back to the character estimate. Built-in stub drivers
+emit the same event shape, one fragment per output line, so offline demos and
+tests exercise the streaming client path.
+
 ## Response handling
 
 The completion content is split on newlines and trimmed, because downstream
@@ -211,7 +270,8 @@ Registered drivers are in-memory only and disappear on restart. `LocalEngine-v0`
 
 ## Known limits
 
-- No streaming; `stream: false` is always sent.
+- Streaming has no resumability: a dropped connection ends the call and clients
+  must retry from scratch.
 - Only one runtime stub driver can be active at a time; the kernel selects the
   first registered entry.
 - `response_format` support depends on the provider; see the JSON mode section.

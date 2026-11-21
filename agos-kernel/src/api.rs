@@ -1,12 +1,17 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use serde::Deserialize;
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
@@ -14,6 +19,7 @@ use tracing::instrument;
 
 use crate::audit_export::{JsonlExporter, StdoutExporter};
 use crate::kernel::agOSKernel;
+use crate::llm::StreamOptions;
 use crate::marketplace::{AgentBuildRequest, AgentSearchQuery};
 use crate::orchestrator::WorkflowDefinition;
 use crate::sandbox::{AAppLoader, InstallResult};
@@ -74,6 +80,7 @@ pub fn create_router(kernel: Arc<agOSKernel>) -> Router {
         .route("/security/auth", post(security_auth_set))
         .route("/security/auth/agent", post(security_auth_agent_token))
         .route("/umi/reason", post(umi_reason))
+        .route("/umi/reason/stream", post(umi_reason_stream))
         .route("/umi/embed", post(umi_embed))
         .route("/umi/compress", post(umi_compress))
         .route("/umi/switch", post(umi_switch))
@@ -491,6 +498,77 @@ async fn umi_reason(
         payload["error"] = serde_json::Value::String(error);
     }
     Json(payload)
+}
+
+#[derive(Deserialize)]
+struct ReasonStreamRequest {
+    prompt_vector: Vec<String>,
+    #[serde(default)]
+    schema: Option<Value>,
+    /// Stop after the estimated output exceeds this many tokens.
+    #[serde(default)]
+    token_budget: Option<u64>,
+    /// Override the driver's idle timeout (seconds without provider data).
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
+}
+
+/// `POST /umi/reason/stream` — server-sent events.
+///
+/// Emits `delta` events as text arrives, then one terminal `done` (carrying the
+/// full `UMIStreamResult`) or `error` event. Errors are events rather than HTTP
+/// status codes because the status line is already sent before generation
+/// starts.
+async fn umi_reason_stream(
+    State(kernel): State<KernelState>,
+    Json(req): Json<ReasonStreamRequest>,
+) -> Sse<UnboundedReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    if let Err(resp) = check_rate_limit(&kernel, "system:umi") {
+        let message = resp.0["error"]
+            .as_str()
+            .unwrap_or("rate limit exceeded")
+            .to_string();
+        let _ = tx.send(Ok(Event::default()
+            .event("error")
+            .data(serde_json::json!({"error": message}).to_string())));
+        return Sse::new(UnboundedReceiverStream::new(rx));
+    }
+
+    let mut options = StreamOptions::default();
+    if let Some(secs) = req.idle_timeout_secs {
+        options.idle_timeout = Duration::from_secs(secs.max(1));
+    }
+    options.token_budget = req.token_budget;
+
+    let schema = req.schema.unwrap_or(Value::Null);
+    let prompt = req.prompt_vector;
+
+    tokio::spawn(async move {
+        let delta_tx = tx.clone();
+        let result = kernel
+            .umi
+            .reason_stream(&prompt, &schema, &options, |delta| {
+                let payload = serde_json::json!({ "delta": delta }).to_string();
+                delta_tx
+                    .send(Ok(Event::default().event("delta").data(payload)))
+                    .is_ok()
+            })
+            .await;
+
+        let event = match result {
+            Ok(outcome) => Event::default()
+                .event("done")
+                .data(serde_json::to_string(&outcome).unwrap_or_default()),
+            Err(error) => Event::default()
+                .event("error")
+                .data(serde_json::json!({ "error": error }).to_string()),
+        };
+        let _ = tx.send(Ok(event));
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
 #[derive(Deserialize)]

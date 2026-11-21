@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::llm::{LlmConfig, LlmDriver, DRIVER_NAME as LIVE_DRIVER_NAME};
+use crate::llm::{LlmConfig, LlmDriver, StreamOptions, DRIVER_NAME as LIVE_DRIVER_NAME};
 
 const TOKEN_COST_LOCAL: u64 = 2;
 const TOKEN_COST_CLOUD: u64 = 5;
@@ -27,6 +27,22 @@ pub struct UMIResult {
     /// Present only when a live driver was selected and the call failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Outcome of a streamed `reason` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UMIStreamResult {
+    pub text: String,
+    pub output: Vec<String>,
+    pub tokens_used: u64,
+    pub model: String,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// Set when the kernel cut the call short (`token_budget`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aborted: Option<String>,
+    pub chunks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +518,97 @@ impl UnifiedModelInterface {
         }
     }
 
+    /// Stream a completion, invoking `on_delta` for every text fragment.
+    ///
+    /// Returning `false` from `on_delta` stops the call (the HTTP layer uses
+    /// this to cancel upstream generation when the client disconnects).
+    ///
+    /// Built-in and runtime stubs emit one fragment per output line so offline
+    /// demos exercise the same client path as the live driver. The live driver
+    /// talks to the provider's SSE stream; see [`StreamOptions`] for the idle
+    /// timeout and token-budget cut-off.
+    pub async fn reason_stream<F>(
+        &self,
+        prompt_vector: &[String],
+        schema: &Value,
+        options: &StreamOptions,
+        mut on_delta: F,
+    ) -> Result<UMIStreamResult, String>
+    where
+        F: FnMut(&str) -> bool + Send,
+    {
+        match self.active_kind() {
+            ActiveDriver::Live => match &self.live {
+                Some(driver) => {
+                    let streamed = driver
+                        .reason_stream(prompt_vector, schema, options, on_delta)
+                        .await?;
+                    Ok(UMIStreamResult {
+                        text: streamed.text,
+                        output: streamed.output,
+                        tokens_used: streamed.tokens_used,
+                        model: streamed.model,
+                        mode: "SYS_REASON".to_string(),
+                        finish_reason: streamed.finish_reason,
+                        aborted: streamed.aborted,
+                        chunks: streamed.chunks,
+                    })
+                }
+                // Live was selected but is not configured: fall back to the stub.
+                None => Self::stub_stream(&LOCAL_DRIVER, prompt_vector, options, &mut on_delta),
+            },
+            ActiveDriver::Local => {
+                Self::stub_stream(&LOCAL_DRIVER, prompt_vector, options, &mut on_delta)
+            }
+            ActiveDriver::Cloud => {
+                Self::stub_stream(&CLOUD_DRIVER, prompt_vector, options, &mut on_delta)
+            }
+            ActiveDriver::Runtime => {
+                let mut drivers = self.runtime_drivers.lock().unwrap();
+                match drivers.values_mut().next() {
+                    Some(d) => {
+                        d.calls += 1;
+                        let tokens = (prompt_vector.len() as u64).max(1) * d.token_cost;
+                        d.total_tokens += tokens;
+                        Ok(stub_stream_output(
+                            &d.name,
+                            &d.prefix,
+                            d.max_output,
+                            tokens,
+                            prompt_vector,
+                            options,
+                            &mut on_delta,
+                        ))
+                    }
+                    None => Self::stub_stream(&LOCAL_DRIVER, prompt_vector, options, &mut on_delta),
+                }
+            }
+        }
+    }
+
+    fn stub_stream<F>(
+        driver: &'static DriverState,
+        prompt_vector: &[String],
+        options: &StreamOptions,
+        on_delta: &mut F,
+    ) -> Result<UMIStreamResult, String>
+    where
+        F: FnMut(&str) -> bool + Send,
+    {
+        driver.calls.fetch_add(1, Ordering::Relaxed);
+        let tokens = (prompt_vector.len() as u64).max(1) * driver.token_cost;
+        driver.total_tokens.fetch_add(tokens, Ordering::Relaxed);
+        Ok(stub_stream_output(
+            driver.name,
+            driver.prefix,
+            driver.max_output,
+            tokens,
+            prompt_vector,
+            options,
+            on_delta,
+        ))
+    }
+
     /// Embed a batch of strings.
     ///
     /// With the live driver active this calls the provider's `/embeddings`
@@ -591,6 +698,62 @@ impl UnifiedModelInterface {
             });
         }
         metrics
+    }
+}
+
+/// Emit a deterministic stub completion as line fragments.
+fn stub_stream_output<F>(
+    name: &str,
+    prefix: &str,
+    max_output: usize,
+    tokens: u64,
+    prompt_vector: &[String],
+    options: &StreamOptions,
+    on_delta: &mut F,
+) -> UMIStreamResult
+where
+    F: FnMut(&str) -> bool + Send,
+{
+    let lines: Vec<String> = prompt_vector
+        .iter()
+        .take(max_output)
+        .map(|line| format!("{prefix}:{line}"))
+        .collect();
+
+    let mut text = String::new();
+    let mut chunks = 0usize;
+    let mut aborted = None;
+    for (index, line) in lines.iter().enumerate() {
+        let fragment = if index + 1 < lines.len() {
+            format!("{line}\n")
+        } else {
+            line.clone()
+        };
+        text.push_str(&fragment);
+        chunks += 1;
+        if !on_delta(&fragment) {
+            aborted = Some("client_closed".to_string());
+            break;
+        }
+
+        if let Some(budget) = options.token_budget {
+            let estimate = (text.chars().count() as u64).div_ceil(4);
+            if estimate > budget {
+                aborted = Some("token_budget".to_string());
+                break;
+            }
+        }
+    }
+
+    UMIStreamResult {
+        output: text.lines().map(str::to_string).collect(),
+        text,
+        tokens_used: tokens,
+        model: name.to_string(),
+        mode: "SYS_REASON".to_string(),
+        finish_reason: aborted.is_none().then(|| "stop".to_string()),
+        aborted,
+        chunks,
     }
 }
 

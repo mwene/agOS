@@ -311,6 +311,41 @@ An optional `schema` switches the live driver into structured-output mode. Accep
 
 In JSON mode the completion is returned as a single element, unsplit. Provider failures return `"mode": "UMI_ERROR"` with an `error` string and an empty `output`.
 
+### `POST /umi/reason/stream` — Stream a reasoning pass (SSE)
+
+Same body as `/umi/reason`, plus optional stream controls:
+
+```json
+{
+  "prompt_vector": ["Write a short haiku."],
+  "schema": null,
+  "token_budget": 40,
+  "idle_timeout_secs": 15
+}
+```
+
+Responds with `text/event-stream`:
+
+| Event | Data | Meaning |
+|-------|------|---------|
+| `delta` | `{"delta": "text"}` | A text fragment; concatenate in order |
+| `done` | full `UMIStreamResult` | Terminal success, includes `aborted` if cut short |
+| `error` | `{"error": "..."}` | Terminal failure |
+
+`done` payload example:
+
+```json
+{"text":"An old silent pond","output":["An old silent pond"],"tokens_used":12,
+ "model":"gpt-4o-mini","mode":"SYS_REASON","finish_reason":"stop","chunks":1}
+```
+
+`token_budget` aborts once the estimated output exceeds the budget and returns
+the partial text with `"aborted": "token_budget"`. `idle_timeout_secs` overrides
+the driver's default idle timeout (`AGOS_LLM_STREAM_IDLE_TIMEOUT_SECS`). There is
+no total-duration timeout. Closing the client connection cancels upstream
+generation at the next fragment. Built-in stub drivers emit the same events one
+fragment per line, so the endpoint works offline.
+
 ### `POST /umi/embed` — Generate embeddings
 
 ```json

@@ -12,12 +12,15 @@
 //! | `AGOS_LLM_BASE_URL` | API root, e.g. `https://api.openai.com/v1` | `https://api.openai.com/v1` |
 //! | `AGOS_LLM_API_KEY` | Bearer token (omit for local runtimes) | none |
 //! | `AGOS_LLM_MODEL` | Model name | `gpt-4o-mini` |
-//! | `AGOS_LLM_TIMEOUT_SECS` | Per-request timeout | `60` |
+//! | `AGOS_LLM_EMBEDDING_MODEL` | Model for `/embeddings` | none (endpoint errors) |
+//! | `AGOS_LLM_TIMEOUT_SECS` | Buffered request timeout | `60` |
+//! | `AGOS_LLM_STREAM_IDLE_TIMEOUT_SECS` | Abort a stream after this long without data | `30` |
 //! | `AGOS_LLM_MAX_TOKENS` | `max_tokens` sent to the provider | provider default |
 //! | `AGOS_LLM_TEMPERATURE` | Sampling temperature | provider default |
 //!
 //! `OPENAI_BASE_URL` / `OPENAI_API_KEY` are accepted as fallbacks.
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -31,6 +34,7 @@ pub const DRIVER_NAME: &str = "OpenAICompatible";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 30;
 const MAX_ERROR_BODY: usize = 500;
 
 /// Configuration for an OpenAI-compatible endpoint.
@@ -41,6 +45,7 @@ pub struct LlmConfig {
     pub model: String,
     pub embedding_model: Option<String>,
     pub timeout_secs: u64,
+    pub stream_idle_timeout_secs: u64,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
@@ -53,6 +58,7 @@ impl LlmConfig {
             model: DEFAULT_MODEL.to_string(),
             embedding_model: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            stream_idle_timeout_secs: DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_tokens: None,
             temperature: None,
         }
@@ -76,6 +82,9 @@ impl LlmConfig {
         let timeout_secs = env_non_empty("AGOS_LLM_TIMEOUT_SECS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let stream_idle_timeout_secs = env_non_empty("AGOS_LLM_STREAM_IDLE_TIMEOUT_SECS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS);
         let max_tokens = env_non_empty("AGOS_LLM_MAX_TOKENS").and_then(|v| v.parse().ok());
         let temperature = env_non_empty("AGOS_LLM_TEMPERATURE").and_then(|v| v.parse().ok());
 
@@ -85,6 +94,7 @@ impl LlmConfig {
             model,
             embedding_model,
             timeout_secs,
+            stream_idle_timeout_secs,
             max_tokens,
             temperature,
         })
@@ -110,6 +120,11 @@ impl LlmConfig {
         self
     }
 
+    pub fn with_stream_idle_timeout_secs(mut self, secs: u64) -> Self {
+        self.stream_idle_timeout_secs = secs;
+        self
+    }
+
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
@@ -131,6 +146,10 @@ impl LlmConfig {
         map.insert("base_url".into(), self.base_url.clone());
         map.insert("model".into(), self.model.clone());
         map.insert("timeout_secs".into(), self.timeout_secs.to_string());
+        map.insert(
+            "stream_idle_timeout_secs".into(),
+            self.stream_idle_timeout_secs.to_string(),
+        );
         if let Some(model) = &self.embedding_model {
             map.insert("embedding_model".into(), model.clone());
         }
@@ -186,6 +205,17 @@ impl LlmConfig {
                     }
                     next.timeout_secs = secs;
                 }
+                "stream_idle_timeout_secs" => {
+                    let secs: u64 = value.parse().map_err(|_| {
+                        format!(
+                            "stream_idle_timeout_secs must be a positive integer, got '{value}'"
+                        )
+                    })?;
+                    if secs == 0 {
+                        return Err("stream_idle_timeout_secs must be greater than zero".into());
+                    }
+                    next.stream_idle_timeout_secs = secs;
+                }
                 "max_tokens" => {
                     next.max_tokens =
                         Some(value.parse().map_err(|_| {
@@ -240,6 +270,7 @@ impl LlmDriver {
         }
         let client = reqwest::Client::builder()
             .user_agent(concat!("agOS/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         Ok(LlmDriver {
@@ -304,6 +335,7 @@ impl LlmDriver {
             temperature: cfg.temperature,
             response_format,
             stream: false,
+            stream_options: None,
         };
 
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -411,6 +443,298 @@ impl LlmDriver {
             .fetch_add(embeddings.tokens_used, Ordering::Relaxed);
         Ok(embeddings)
     }
+
+    /// Stream a completion, invoking `on_delta` for each text fragment.
+    ///
+    /// Returning `false` from `on_delta` (for example because the HTTP client
+    /// disconnected) drops the provider connection and returns the partial
+    /// text with `aborted = "client_closed"`.
+    ///
+    /// Unlike `reason`, this does not apply a total request timeout: the call
+    /// may legitimately run for minutes. Instead it aborts when no bytes arrive
+    /// for `options.idle_timeout`, or as soon as the estimated output exceeds
+    /// `options.token_budget` (partial text is returned with `aborted` set).
+    ///
+    /// The return value is authoritative: `text` is the full accumulation,
+    /// even after a budget cut-off.
+    pub async fn reason_stream<F>(
+        &self,
+        prompt_vector: &[String],
+        schema: &Value,
+        options: &StreamOptions,
+        mut on_delta: F,
+    ) -> Result<LlmStreamResult, String>
+    where
+        F: FnMut(&str) -> bool + Send,
+    {
+        let cfg = self.config_snapshot();
+        let response_format = ResponseFormat::from_schema(schema);
+        let json_mode = response_format.is_some();
+        let messages = build_messages(prompt_vector, json_mode);
+        let prompt_text = messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let request = ChatRequest {
+            model: cfg.model.clone(),
+            messages,
+            max_tokens: cfg.max_tokens,
+            temperature: cfg.temperature,
+            response_format,
+            stream: true,
+            stream_options: Some(StreamOptionsRequest {
+                include_usage: true,
+            }),
+        };
+
+        self.calls.fetch_add(1, Ordering::Relaxed);
+
+        let mut req = self.client.post(cfg.endpoint()).json(&request);
+
+        if let Some(key) = cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = req.bearer_auth(key);
+        }
+
+        let response = req.send().await.map_err(|e| {
+            format!(
+                "request to {} failed: {}",
+                cfg.endpoint(),
+                describe_reqwest_error(&e)
+            )
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|e| format!("failed to read model response: {e}"))?;
+            return Err(format!(
+                "model API returned HTTP {}: {}",
+                status.as_u16(),
+                truncate(&body, MAX_ERROR_BODY)
+            ));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut parser = SseParser::default();
+        let mut text = String::new();
+        let mut provider_tokens: Option<u64> = None;
+        let mut model = cfg.model.clone();
+        let mut finish_reason: Option<String> = None;
+        let mut aborted: Option<String> = None;
+        let mut chunks = 0usize;
+        let mut finished = false;
+
+        'stream: while !finished {
+            let next = tokio::time::timeout(options.idle_timeout, stream.next()).await;
+            let bytes = match next {
+                Err(_) => {
+                    return Err(format!(
+                        "model stream stalled: no data for {:?}",
+                        options.idle_timeout
+                    ))
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(format!("model stream error: {e}")),
+                Ok(Some(Ok(bytes))) => bytes,
+            };
+
+            for payload in parser.push(&bytes) {
+                if payload == "[DONE]" {
+                    finished = true;
+                    break;
+                }
+
+                let parsed: StreamChunk = match serde_json::from_str(&payload) {
+                    Ok(chunk) => chunk,
+                    // Ignore keepalives / non-JSON provider noise.
+                    Err(_) => continue,
+                };
+
+                if let Some(error) = parsed.error {
+                    return Err(format!(
+                        "model stream error: {}",
+                        error
+                            .message
+                            .or(error.kind)
+                            .unwrap_or_else(|| "unknown provider error".to_string())
+                    ));
+                }
+
+                if let Some(name) = parsed.model {
+                    model = name;
+                }
+                if let Some(tokens) = parsed.usage.and_then(|usage| usage.total_tokens) {
+                    provider_tokens = Some(tokens);
+                }
+
+                if let Some(choice) = parsed.choices.into_iter().next() {
+                    if let Some(reason) = choice.finish_reason {
+                        finish_reason = Some(reason);
+                    }
+                    if let Some(delta) = choice.delta.content {
+                        if !delta.is_empty() {
+                            text.push_str(&delta);
+                            chunks += 1;
+                            if !on_delta(&delta) {
+                                aborted = Some("client_closed".to_string());
+                                break 'stream;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(budget) = options.token_budget {
+                    if estimate_tokens(&text) > budget {
+                        aborted = Some("token_budget".to_string());
+                        break 'stream;
+                    }
+                }
+            }
+        }
+
+        let tokens_used = provider_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or_else(|| estimate_tokens(&prompt_text) + estimate_tokens(&text));
+        self.total_tokens.fetch_add(tokens_used, Ordering::Relaxed);
+
+        let output = split_response(&text, json_mode);
+        Ok(LlmStreamResult {
+            output,
+            text,
+            tokens_used,
+            model,
+            finish_reason,
+            aborted,
+            chunks,
+        })
+    }
+}
+
+/// Controls for `reason_stream`.
+#[derive(Debug, Clone)]
+pub struct StreamOptions {
+    /// Abort the call when the provider sends nothing for this long.
+    pub idle_timeout: Duration,
+    /// Stop reading once the accumulated output estimate exceeds this.
+    pub token_budget: Option<u64>,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        StreamOptions {
+            idle_timeout: Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+            token_budget: None,
+        }
+    }
+}
+
+/// Outcome of a streamed completion.
+#[derive(Debug, Clone)]
+pub struct LlmStreamResult {
+    /// Full accumulated text, including any partial output after a cut-off.
+    pub text: String,
+    /// Line-oriented view used by the buffered API (unsplit in JSON mode).
+    pub output: Vec<String>,
+    pub tokens_used: u64,
+    pub model: String,
+    pub finish_reason: Option<String>,
+    /// Set when the kernel stopped early (`token_budget`).
+    pub aborted: Option<String>,
+    /// Number of non-empty content fragments received.
+    pub chunks: usize,
+}
+
+/// Minimal server-sent-events reassembler.
+///
+/// Providers may split an event across TCP chunks, use `\r\n` line endings, or
+/// send multi-line `data:` fields. Bytes are buffered until a blank line marks
+/// the end of an event.
+#[derive(Debug, Default)]
+struct SseParser {
+    buffer: Vec<u8>,
+}
+
+impl SseParser {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buffer.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some((end, sep_len)) = find_event_boundary(&self.buffer) {
+            let block = String::from_utf8_lossy(&self.buffer[..end]).into_owned();
+            self.buffer.drain(..end + sep_len);
+            if let Some(payload) = parse_sse_block(&block) {
+                events.push(payload);
+            }
+        }
+        events
+    }
+}
+
+fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+fn parse_sse_block(block: &str) -> Option<String> {
+    let mut data = Vec::new();
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+    }
+    if data.is_empty() {
+        None
+    } else {
+        Some(data.join("\n"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    error: Option<StreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -424,6 +748,14 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsRequest>,
+}
+
+/// Ask the provider to include a final `usage` chunk while streaming.
+#[derive(Debug, Serialize)]
+struct StreamOptionsRequest {
+    include_usage: bool,
 }
 
 /// Provider-side structured-output selector.
@@ -995,6 +1327,66 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct StreamMockState {
+        received: Arc<Mutex<Vec<Value>>>,
+        chunks: Arc<Vec<String>>,
+        stall: bool,
+    }
+
+    async fn mock_stream(
+        State(state): State<StreamMockState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        state.received.lock().unwrap().push(json!({
+            "body": body,
+            "authorization": headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or(""),
+        }));
+
+        let chunks = state
+            .chunks
+            .as_ref()
+            .clone()
+            .into_iter()
+            .map(|chunk| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk)));
+        let stream = futures_util::stream::iter(chunks);
+        let body = if state.stall {
+            axum::body::Body::from_stream(stream.chain(futures_util::stream::pending()))
+        } else {
+            axum::body::Body::from_stream(stream)
+        };
+
+        axum::response::Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(body)
+            .unwrap()
+    }
+
+    async fn spawn_stream_mock(
+        chunks: Vec<&'static str>,
+        stall: bool,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<Value>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let state = StreamMockState {
+            received: received.clone(),
+            chunks: Arc::new(chunks.into_iter().map(str::to_string).collect()),
+            stall,
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_stream))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, received)
+    }
+
     async fn spawn_mock(status: u16) -> (std::net::SocketAddr, Arc<Mutex<Vec<Value>>>) {
         let received = Arc::new(Mutex::new(Vec::new()));
         let state = MockState {
@@ -1221,5 +1613,189 @@ mod tests {
 
         let err = driver.embed(&["alpha".to_string()]).await.unwrap_err();
         assert!(err.contains("embedding model not configured"), "{err}");
+    }
+
+    #[test]
+    fn sse_parser_reassembles_split_events() {
+        let mut parser = SseParser::default();
+        assert!(parser.push(b"data: one\n").is_empty());
+        assert_eq!(
+            parser.push(b"\ndata: two\r\n\r\ndata: thr"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(parser.push(b"ee\n\n"), vec!["three".to_string()]);
+    }
+
+    #[test]
+    fn sse_parser_joins_multiline_data() {
+        let mut parser = SseParser::default();
+        assert_eq!(
+            parser.push(b"data: {\"a\":\ndata: 1}\n\n"),
+            vec!["{\"a\":\n1}".to_string()]
+        );
+    }
+
+    fn stream_chunks() -> Vec<&'static str> {
+        vec![
+            "data: {\"model\":\"stream-model\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+        ]
+    }
+
+    #[tokio::test]
+    async fn streams_deltas_and_final_usage() {
+        let (addr, received) = spawn_stream_mock(stream_chunks(), false).await;
+        let driver = LlmDriver::new(cfg_for(addr).with_api_key("sk-stream")).unwrap();
+
+        let mut deltas = Vec::new();
+        let result = driver
+            .reason_stream(
+                &["hi".to_string()],
+                &Value::Null,
+                &StreamOptions {
+                    idle_timeout: Duration::from_secs(5),
+                    token_budget: None,
+                },
+                |delta| {
+                    deltas.push(delta.to_string());
+                    true
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deltas, vec!["Hel", "lo"]);
+        assert_eq!(result.text, "Hello");
+        assert_eq!(result.output, vec!["Hello"]);
+        assert_eq!(result.tokens_used, 5);
+        assert_eq!(result.model, "stream-model");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(result.chunks, 2);
+        assert!(result.aborted.is_none());
+        assert_eq!(driver.total_tokens(), 5);
+
+        let received = received.lock().unwrap();
+        assert_eq!(received[0]["authorization"], "Bearer sk-stream");
+        assert_eq!(received[0]["body"]["stream"], true);
+        assert_eq!(received[0]["body"]["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_stops_at_the_token_budget() {
+        let (addr, _) = spawn_stream_mock(stream_chunks(), false).await;
+        let driver = LlmDriver::new(cfg_for(addr)).unwrap();
+
+        let result = driver
+            .reason_stream(
+                &["hi".to_string()],
+                &Value::Null,
+                &StreamOptions {
+                    idle_timeout: Duration::from_secs(5),
+                    token_budget: Some(0),
+                },
+                |_| true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.aborted.as_deref(), Some("token_budget"));
+        assert_eq!(result.text, "Hel");
+        assert_eq!(result.chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_times_out_when_provider_stalls() {
+        let (addr, _) = spawn_stream_mock(
+            vec!["data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"],
+            true,
+        )
+        .await;
+        let driver = LlmDriver::new(cfg_for(addr)).unwrap();
+
+        let err = driver
+            .reason_stream(
+                &["hi".to_string()],
+                &Value::Null,
+                &StreamOptions {
+                    idle_timeout: Duration::from_millis(200),
+                    token_budget: None,
+                },
+                |_| true,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("stalled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_surfaces_provider_error_events() {
+        let (addr, _) = spawn_stream_mock(
+            vec!["data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n"],
+            false,
+        )
+        .await;
+        let driver = LlmDriver::new(cfg_for(addr)).unwrap();
+
+        let err = driver
+            .reason_stream(
+                &["hi".to_string()],
+                &Value::Null,
+                &StreamOptions::default(),
+                |_| true,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_stops_when_the_client_disconnects() {
+        let (addr, _) = spawn_stream_mock(stream_chunks(), false).await;
+        let driver = LlmDriver::new(cfg_for(addr)).unwrap();
+
+        let result = driver
+            .reason_stream(
+                &["hi".to_string()],
+                &Value::Null,
+                &StreamOptions::default(),
+                |_| false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.aborted.as_deref(), Some("client_closed"));
+        assert_eq!(result.text, "Hel");
+        assert_eq!(result.chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_json_payload_unsplit() {
+        let (addr, _) = spawn_stream_mock(
+            vec![
+                "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\":\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"1}\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            false,
+        )
+        .await;
+        let driver = LlmDriver::new(cfg_for(addr)).unwrap();
+
+        let result = driver
+            .reason_stream(
+                &["hi".to_string()],
+                &json!({"type": "json_object"}),
+                &StreamOptions::default(),
+                |_| true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "{\"a\":1}");
+        assert_eq!(result.output, vec!["{\"a\":1}"]);
     }
 }
