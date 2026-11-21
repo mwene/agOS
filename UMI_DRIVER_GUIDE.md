@@ -29,6 +29,7 @@ Set the environment before starting the kernel:
 export AGOS_LLM_BASE_URL="https://api.openai.com/v1"   # or DeepSeek, Groq, vLLM, LM Studio...
 export AGOS_LLM_API_KEY="sk-..."                       # omit for local runtimes
 export AGOS_LLM_MODEL="gpt-4o-mini"
+export AGOS_LLM_EMBEDDING_MODEL="text-embedding-3-small"  # optional, for /umi/embed
 export AGOS_LLM_TIMEOUT_SECS="60"
 export AGOS_LLM_MAX_TOKENS="1024"                      # optional
 export AGOS_LLM_TEMPERATURE="0.2"                      # optional
@@ -62,7 +63,7 @@ curl -X POST http://127.0.0.1:7400/umi/switch \
 
 # Inspect drivers, config (key redacted), and counters
 curl http://127.0.0.1:7400/umi/drivers
-curl http://127.0.0.1:7400/umi/driver/OpenAICompatible
+curl http://127.0.0.1:7400/umi/driver/info/OpenAICompatible
 curl http://127.0.0.1:7400/umi/metrics
 ```
 
@@ -95,6 +96,55 @@ The kernel builds `prompt_vector` as an instruction-first list:
 This matches how call sites in `orchestrator.rs`, `marketplace.rs`, and
 `embodiment.rs` construct prompts (instructions first, then task data, then an
 output-format hint).
+
+## Structured output (JSON mode)
+
+`reason()` takes a `schema` argument that maps onto the provider's
+`response_format`:
+
+| `schema` value | Provider request |
+|----------------|------------------|
+| `null` | none (plain text) |
+| `true`, `"json"`, `"json_object"`, `{"type":"json_object"}` | `{"type":"json_object"}` |
+| a JSON Schema, e.g. `{"type":"object","properties":{...}}` | `{"type":"json_schema","json_schema":{"name":...,"schema":...,"strict":false}}` |
+| `{"type":"json_schema","json_schema":{...}}` | passed through |
+| anything else (e.g. `{"task":"condition_check"}`) | ignored, plain text |
+
+OpenAI requires the word "json" to appear in the messages when JSON mode is on,
+so a short instruction is appended to the system message if the prompt does not
+already mention it. In JSON mode the completion is returned as a single element
+and is **not** split into lines, so `output[0]` is valid JSON.
+
+Not every OpenAI-compatible runtime implements `response_format` (Ollama and
+LM Studio vary by version). If the provider rejects the field, the call returns
+`UMI_ERROR`; drop the `schema` argument for that provider.
+
+## Embeddings
+
+`/umi/embed` calls `{base_url}/embeddings` when the live driver is active and
+`AGOS_LLM_EMBEDDING_MODEL` is configured. One vector is returned per input, in
+input order, using the provider's `data[].index` when present.
+
+```bash
+curl -X POST http://127.0.0.1:7400/umi/embed \
+  -H 'Content-Type: application/json' \
+  -d '{"data": ["invoice one", "invoice two"]}'
+```
+
+```json
+{
+  "embeddings": [[0.011, -0.023, ...], [0.004, 0.031, ...]],
+  "dimensions": 1536,
+  "count": 2,
+  "driver": "OpenAICompatible",
+  "mode": "SYS_EMBED"
+}
+```
+
+Single-input calls also receive the legacy `"embedding": [...]` field. Without
+an embedding model the endpoint returns `UMI_ERROR` rather than silently mixing
+deterministic vectors with provider vectors. The deterministic drivers return
+16-dimensional unit vectors derived from a stable hash.
 
 ## Response handling
 
@@ -162,9 +212,6 @@ Registered drivers are in-memory only and disappear on restart. `LocalEngine-v0`
 ## Known limits
 
 - No streaming; `stream: false` is always sent.
-- Embeddings still use the deterministic local hash (`/umi/embed`); the live
-  driver covers reasoning only.
-- The `schema` argument to `reason()` is not yet mapped to a provider
-  `response_format`/JSON mode.
 - Only one runtime stub driver can be active at a time; the kernel selects the
   first registered entry.
+- `response_format` support depends on the provider; see the JSON mode section.

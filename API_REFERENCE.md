@@ -300,16 +300,35 @@ Response:
 {"output": ["reasoned:What is 2+2?"], "tokens_used": 2, "model": "LocalEngine-v0", "mode": "SYS_REASON"}
 ```
 
+An optional `schema` switches the live driver into structured-output mode. Accepts `true`, `"json_object"`, or a JSON Schema:
+
+```json
+{
+  "prompt_vector": ["Extract the total from: Invoice 44, total 1200 EUR"],
+  "schema": {"type": "object", "name": "invoice", "properties": {"total": {"type": "number"}}}
+}
+```
+
+In JSON mode the completion is returned as a single element, unsplit. Provider failures return `"mode": "UMI_ERROR"` with an `error` string and an empty `output`.
+
 ### `POST /umi/embed` — Generate embeddings
 
 ```json
 {"data": ["hello", "world"]}
 ```
 
-Response:
+Response (one vector per input, in input order):
 ```json
-{"embedding": [0.42, 0.13, ...], "driver": "LocalEngine-v0"}
+{
+  "embeddings": [[0.42, 0.13, ...], [0.11, 0.91, ...]],
+  "dimensions": 1536,
+  "count": 2,
+  "driver": "OpenAICompatible",
+  "mode": "SYS_EMBED"
+}
 ```
+
+For a single input the legacy `"embedding": [...]` field is also included. The live driver requires `AGOS_LLM_EMBEDDING_MODEL`; without it the endpoint returns `"mode": "UMI_ERROR"`. The deterministic drivers return 16-dimensional unit vectors.
 
 ### `POST /umi/compress` — Compress data via the active driver
 
@@ -368,9 +387,9 @@ Error:
 {"error": "Driver 'Foo' not found"}
 ```
 
-### `GET /umi/driver/download/:name` — Download full driver config (includes API keys)
+### `GET /umi/driver/download/:name` — Download driver config
 
-Requires `X-API-Key` header if authentication is enabled.
+Requires `X-API-Key` header if authentication is enabled. The live driver's config is always redacted (`"api_key": "***"`); runtime stub drivers return the config map they were registered with.
 
 Response:
 ```json

@@ -8,7 +8,7 @@
 
 ## Project Status
 
-**Alpha — a working system, not a research prototype.** All thirteen kernel phases are implemented: ~9,500 lines of Rust, 100+ REST endpoints, and 50 passing tests (`cargo test`). That covers the cognitive scheduler, hierarchical memory and cIPC bus, Ring 0 policy layer, `.aapp` packaging and signing, workflow orchestration, governance, structured audit export, and the HTTP API.
+**Alpha — a working system, not a research prototype.** All thirteen kernel phases are implemented: ~9,500 lines of Rust, 100+ REST endpoints, and 72 passing tests (`cargo test`). That covers the cognitive scheduler, hierarchical memory and cIPC bus, Ring 0 policy layer, `.aapp` packaging and signing, workflow orchestration, governance, structured audit export, and the HTTP API.
 
 Model inference sits behind the UMI driver boundary. Two deterministic stub drivers keep tests and offline builds reproducible, and a live driver for any OpenAI-compatible endpoint (OpenAI, DeepSeek, Ollama, vLLM, LM Studio) activates from environment configuration — see [Model Drivers (UMI)](#model-drivers-umi).
 
@@ -165,6 +165,7 @@ The kernel reaches models through the Unified Model Interface. Two deterministic
 | `AGOS_LLM_BASE_URL` | API root | `https://api.openai.com/v1` |
 | `AGOS_LLM_API_KEY` | Bearer token (omit for local runtimes) | none |
 | `AGOS_LLM_MODEL` | Model name | `gpt-4o-mini` |
+| `AGOS_LLM_EMBEDDING_MODEL` | Embedding model for `/umi/embed` | none (endpoint errors) |
 | `AGOS_LLM_TIMEOUT_SECS` | Per-request timeout | `60` |
 | `AGOS_LLM_MAX_TOKENS` | `max_tokens` sent to the provider | provider default |
 | `AGOS_LLM_TEMPERATURE` | Sampling temperature | provider default |
@@ -176,10 +177,12 @@ The kernel reaches models through the Unified Model Interface. Two deterministic
 export AGOS_LLM_BASE_URL="https://api.deepseek.com/v1"
 export AGOS_LLM_API_KEY="sk-..."
 export AGOS_LLM_MODEL="deepseek-chat"
+export AGOS_LLM_EMBEDDING_MODEL="text-embedding-3-small"   # optional, for /umi/embed
 
 # Or local (no key required)
 export AGOS_LLM_BASE_URL="http://localhost:11434/v1"
 export AGOS_LLM_MODEL="llama3.1"
+export AGOS_LLM_EMBEDDING_MODEL="nomic-embed-text"
 
 cd agos-kernel && cargo run --release
 ```
@@ -194,6 +197,20 @@ curl -X POST http://127.0.0.1:7400/umi/switch \
 curl -X POST http://127.0.0.1:7400/umi/reason \
   -H 'Content-Type: application/json' \
   -d '{"prompt_vector": ["You are a terse assistant.", "Name the capital of Kenya."]}'
+
+# Structured output: the provider receives response_format, and the completion
+# is returned as one JSON element instead of being split into lines.
+curl -X POST http://127.0.0.1:7400/umi/reason \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt_vector": ["Extract the invoice total."],
+       "schema": {"type": "object", "name": "invoice",
+                  "properties": {"total": {"type": "number"}},
+                  "required": ["total"]}}'
+
+# Embeddings (requires AGOS_LLM_EMBEDDING_MODEL)
+curl -X POST http://127.0.0.1:7400/umi/embed \
+  -H 'Content-Type: application/json' \
+  -d '{"data": ["invoice one", "invoice two"]}'
 
 curl http://127.0.0.1:7400/umi/metrics
 ```

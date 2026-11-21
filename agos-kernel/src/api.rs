@@ -467,6 +467,9 @@ async fn security_auth_agent_token(
 #[derive(Deserialize)]
 struct ReasonRequest {
     prompt_vector: Vec<String>,
+    /// Optional structured-output hint used by the live driver.
+    #[serde(default)]
+    schema: Option<Value>,
 }
 
 async fn umi_reason(
@@ -476,7 +479,8 @@ async fn umi_reason(
     if let Err(resp) = check_rate_limit(&kernel, "system:umi") {
         return resp;
     }
-    let result = kernel.umi.reason(&req.prompt_vector, &Value::Null).await;
+    let schema = req.schema.unwrap_or(Value::Null);
+    let result = kernel.umi.reason(&req.prompt_vector, &schema).await;
     let mut payload = serde_json::json!({
         "output": result.output,
         "tokens_used": result.tokens_used,
@@ -501,8 +505,34 @@ async fn umi_embed(
     if let Err(resp) = check_rate_limit(&kernel, "system:umi") {
         return resp;
     }
-    let embedding = kernel.umi.embed(&req.data);
-    Json(serde_json::json!({"embedding": embedding, "driver": kernel.umi.active_name()}))
+    match kernel.umi.embed(&req.data).await {
+        Ok(vectors) => {
+            let dimensions = vectors.first().map(|v| v.len()).unwrap_or(0);
+            let single = if vectors.len() == 1 {
+                Some(vectors[0].clone())
+            } else {
+                None
+            };
+            let mut payload = serde_json::json!({
+                "embeddings": vectors,
+                "dimensions": dimensions,
+                "count": req.data.len(),
+                "driver": kernel.umi.active_name(),
+                "mode": "SYS_EMBED",
+            });
+            // Backwards-compatible shape for single-input callers.
+            if let Some(embedding) = single {
+                payload["embedding"] = serde_json::json!(embedding);
+            }
+            Json(payload)
+        }
+        Err(error) => Json(serde_json::json!({
+            "embeddings": [],
+            "driver": kernel.umi.active_name(),
+            "mode": "UMI_ERROR",
+            "error": error,
+        })),
+    }
 }
 
 #[derive(Deserialize)]

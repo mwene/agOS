@@ -17,7 +17,6 @@ const DRIVER_RUNTIME: u32 = 2;
 const DRIVER_LIVE: u32 = 100;
 
 const LIVE_DRIVER_CAPABILITY: u32 = 8;
-const LIVE_EMBED_MODULUS: u64 = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UMIResult {
@@ -264,7 +263,8 @@ impl UnifiedModelInterface {
                 capability_level: LIVE_DRIVER_CAPABILITY,
                 token_cost: 0,
                 prefix: live.config_snapshot().model,
-                embed_modulus: LIVE_EMBED_MODULUS,
+                // Provider-defined; stub fallback uses the local modulus.
+                embed_modulus: 0,
                 // Not used for live drivers: responses are not truncated.
                 max_output: 0,
                 calls: live.calls(),
@@ -312,7 +312,8 @@ impl UnifiedModelInterface {
                 capability_level: LIVE_DRIVER_CAPABILITY,
                 token_cost: 0,
                 prefix: live.config_snapshot().model,
-                embed_modulus: LIVE_EMBED_MODULUS,
+                // Provider-defined; stub fallback uses the local modulus.
+                embed_modulus: 0,
                 max_output: 0,
                 calls: live.calls(),
                 total_tokens: live.total_tokens(),
@@ -447,12 +448,12 @@ impl UnifiedModelInterface {
         }
     }
 
-    pub async fn reason(&self, prompt_vector: &[String], _schema: &Value) -> UMIResult {
+    pub async fn reason(&self, prompt_vector: &[String], schema: &Value) -> UMIResult {
         match self.active_kind() {
             ActiveDriver::Local => Self::stub_reason(&LOCAL_DRIVER, prompt_vector),
             ActiveDriver::Cloud => Self::stub_reason(&CLOUD_DRIVER, prompt_vector),
             ActiveDriver::Live => match &self.live {
-                Some(driver) => match driver.reason(prompt_vector).await {
+                Some(driver) => match driver.reason(prompt_vector, schema).await {
                     Ok(completion) => UMIResult {
                         output: completion.output,
                         tokens_used: completion.tokens_used,
@@ -501,32 +502,40 @@ impl UnifiedModelInterface {
         }
     }
 
-    pub fn embed(&self, data: &[String]) -> Vec<f64> {
-        let modulus = match self.active_kind() {
+    /// Embed a batch of strings.
+    ///
+    /// With the live driver active this calls the provider's `/embeddings`
+    /// endpoint and requires `AGOS_LLM_EMBEDDING_MODEL`. The deterministic
+    /// drivers return 16-dimensional unit vectors derived from a stable hash,
+    /// which keeps offline behaviour reproducible for tests.
+    pub async fn embed(&self, data: &[String]) -> Result<Vec<Vec<f64>>, String> {
+        match self.active_kind() {
+            ActiveDriver::Live => match &self.live {
+                Some(driver) => driver
+                    .embed(data)
+                    .await
+                    .map(|embeddings| embeddings.vectors),
+                None => Ok(stub_embeddings(data, LOCAL_DRIVER.embed_modulus)),
+            },
             ActiveDriver::Local => {
                 LOCAL_DRIVER.calls.fetch_add(1, Ordering::Relaxed);
-                LOCAL_DRIVER.embed_modulus
+                Ok(stub_embeddings(data, LOCAL_DRIVER.embed_modulus))
             }
             ActiveDriver::Cloud => {
                 CLOUD_DRIVER.calls.fetch_add(1, Ordering::Relaxed);
-                CLOUD_DRIVER.embed_modulus
+                Ok(stub_embeddings(data, CLOUD_DRIVER.embed_modulus))
             }
-            // Embeddings still use the deterministic local hash: the live
-            // driver covers reasoning only until `/embeddings` is wired.
-            ActiveDriver::Live => LIVE_EMBED_MODULUS,
             ActiveDriver::Runtime => {
                 let mut drivers = self.runtime_drivers.lock().unwrap();
                 match drivers.values_mut().next() {
                     Some(d) => {
                         d.calls += 1;
-                        d.embed_modulus
+                        Ok(stub_embeddings(data, d.embed_modulus))
                     }
-                    None => LOCAL_DRIVER.embed_modulus,
+                    None => Ok(stub_embeddings(data, LOCAL_DRIVER.embed_modulus)),
                 }
             }
-        };
-
-        hash_embedding(data, modulus)
+        }
     }
 
     pub fn compress(&self, data: &[String]) -> Value {
@@ -585,14 +594,29 @@ impl UnifiedModelInterface {
     }
 }
 
-fn hash_embedding(data: &[String], modulus: u64) -> Vec<f64> {
+const STUB_EMBEDDING_DIMENSIONS: usize = 16;
+
+fn stub_embeddings(data: &[String], salt: u64) -> Vec<Vec<f64>> {
+    data.iter().map(|text| stub_embedding(text, salt)).collect()
+}
+
+fn stub_embedding(text: &str, salt: u64) -> Vec<f64> {
     use std::hash::{Hash, Hasher};
-    let modulus = modulus.max(1);
-    data.iter()
-        .map(|s| {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            s.hash(&mut h);
-            (h.finish() % modulus) as f64 / modulus as f64
-        })
-        .collect()
+
+    let mut vector = Vec::with_capacity(STUB_EMBEDDING_DIMENSIONS);
+    for index in 0..STUB_EMBEDDING_DIMENSIONS {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        salt.hash(&mut hasher);
+        (index as u64).hash(&mut hasher);
+        // Map the hash into [-1.0, 1.0].
+        vector.push((hasher.finish() % 2_000_001) as f64 / 1_000_000.0 - 1.0);
+    }
+
+    let norm = vector.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm > f64::EPSILON {
+        vector.iter().map(|x| x / norm).collect()
+    } else {
+        vector
+    }
 }
